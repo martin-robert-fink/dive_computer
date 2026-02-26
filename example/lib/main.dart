@@ -33,7 +33,6 @@ class _HomePageState extends State<HomePage> {
   final _plugin = DiveComputerPlugin.instance;
 
   String _libraryVersion = 'Loading...';
-  List<DcDiveComputer> _shearwaterDescriptors = [];
   String _statusMessage = '';
 
   // BLE scan state
@@ -46,6 +45,16 @@ class _HomePageState extends State<HomePage> {
   bool _isConnected = false;
   DcDeviceInfo? _connectedDevice;
 
+  // Download state
+  bool _isDownloading = false;
+  double _downloadProgress = 0;
+  int _downloadCurrent = 0;
+  int _downloadMaximum = 0;
+  final List<DcDive> _dives = [];
+  StreamSubscription<Map<String, dynamic>>? _downloadSubscription;
+  int? _devInfoSerial;
+  int? _devInfoFirmware;
+
   @override
   void initState() {
     super.initState();
@@ -55,6 +64,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _stopScan();
+    _downloadSubscription?.cancel();
     super.dispose();
   }
 
@@ -62,23 +72,12 @@ class _HomePageState extends State<HomePage> {
     try {
       final version = await _plugin.getLibraryVersion();
       setState(() => _libraryVersion = version);
-
-      final descriptors = await _plugin.getSupportedDescriptors();
-      final shearwater = descriptors
-          .map((d) => DcDiveComputer.fromMap(d))
-          .where((d) => d.vendor == 'Shearwater')
-          .toList();
-
-      setState(() {
-        _shearwaterDescriptors = shearwater;
-        _statusMessage =
-            'Found ${shearwater.length} Shearwater models. '
-            'BLE models: ${shearwater.where((d) => d.supportsBle).length}';
-      });
     } catch (e) {
       setState(() => _statusMessage = 'Error: $e');
     }
   }
+
+  // MARK: - Scanning
 
   void _startScan() {
     setState(() {
@@ -90,11 +89,11 @@ class _HomePageState extends State<HomePage> {
       (event) {
         final device = DcDeviceInfo.fromMap(event);
         setState(() {
-          final existingIndex = _discoveredDevices.indexWhere(
+          final idx = _discoveredDevices.indexWhere(
             (d) => d.address == device.address,
           );
-          if (existingIndex >= 0) {
-            _discoveredDevices[existingIndex] = device;
+          if (idx >= 0) {
+            _discoveredDevices[idx] = device;
           } else {
             _discoveredDevices.add(device);
           }
@@ -106,9 +105,7 @@ class _HomePageState extends State<HomePage> {
           _statusMessage = 'Scan error: $error';
         });
       },
-      onDone: () {
-        setState(() => _isScanning = false);
-      },
+      onDone: () => setState(() => _isScanning = false),
     );
   }
 
@@ -118,13 +115,12 @@ class _HomePageState extends State<HomePage> {
     try {
       await _plugin.stopScan();
     } catch (_) {}
-    if (mounted) {
-      setState(() => _isScanning = false);
-    }
+    if (mounted) setState(() => _isScanning = false);
   }
 
+  // MARK: - Connection
+
   Future<void> _connectToDevice(DcDeviceInfo device) async {
-    // Stop scanning first
     await _stopScan();
 
     setState(() {
@@ -158,6 +154,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _disconnect() async {
+    _downloadSubscription?.cancel();
+    _downloadSubscription = null;
     setState(() => _statusMessage = 'Disconnecting...');
 
     try {
@@ -166,10 +164,90 @@ class _HomePageState extends State<HomePage> {
 
     setState(() {
       _isConnected = false;
+      _isDownloading = false;
       _connectedDevice = null;
+      _dives.clear();
+      _downloadProgress = 0;
+      _downloadCurrent = 0;
+      _downloadMaximum = 0;
+      _devInfoSerial = null;
+      _devInfoFirmware = null;
       _statusMessage = 'Disconnected';
     });
   }
+
+  // MARK: - Download
+
+  void _cancelDownload() {
+    _downloadSubscription?.cancel();
+    _downloadSubscription = null;
+    setState(() {
+      _isDownloading = false;
+      _statusMessage = 'Download cancelled — ${_dives.length} dives retrieved';
+    });
+  }
+
+  void _startDownload() {
+    setState(() {
+      _isDownloading = true;
+      _downloadProgress = 0;
+      _downloadCurrent = 0;
+      _downloadMaximum = 0;
+      _dives.clear();
+      _devInfoSerial = null;
+      _devInfoFirmware = null;
+      _statusMessage = 'Downloading dives...';
+    });
+
+    _downloadSubscription = _plugin.downloadDives().listen(
+      (event) {
+        final type = event['type'] as String?;
+
+        switch (type) {
+          case 'progress':
+            final current = event['current'] as int? ?? 0;
+            final maximum = event['maximum'] as int? ?? 1;
+            setState(() {
+              _downloadCurrent = current;
+              _downloadMaximum = maximum;
+              _downloadProgress = maximum > 0 ? current / maximum : 0;
+            });
+
+          case 'devinfo':
+            setState(() {
+              _devInfoSerial = event['serial'] as int?;
+              _devInfoFirmware = event['firmware'] as int?;
+            });
+
+          case 'dive':
+            final dive = DcDive.fromMap(event);
+            setState(() {
+              _dives.add(dive);
+              _statusMessage = 'Downloaded ${_dives.length} dives...';
+            });
+
+          case 'complete':
+            final total = event['totalDives'] as int? ?? _dives.length;
+            setState(() {
+              _isDownloading = false;
+              _downloadProgress = 1.0;
+              _statusMessage = 'Download complete: $total dives';
+            });
+        }
+      },
+      onError: (error) {
+        setState(() {
+          _isDownloading = false;
+          _statusMessage = 'Download error: $error';
+        });
+      },
+      onDone: () {
+        setState(() => _isDownloading = false);
+      },
+    );
+  }
+
+  // MARK: - Build
 
   @override
   Widget build(BuildContext context) {
@@ -180,7 +258,7 @@ class _HomePageState extends State<HomePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Library status card
+            // Library status
             Card(
               child: ListTile(
                 leading: Icon(
@@ -223,8 +301,9 @@ class _HomePageState extends State<HomePage> {
               ),
             const SizedBox(height: 16),
 
-            // Connected device card with disconnect
+            // Connected device section
             if (_isConnected && _connectedDevice != null) ...[
+              // Device info card with disconnect
               Card(
                 color: Colors.green.shade50,
                 child: ListTile(
@@ -237,27 +316,78 @@ class _HomePageState extends State<HomePage> {
                     '${_connectedDevice!.vendor} ${_connectedDevice!.product}',
                     style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
-                  subtitle: Text(_connectedDevice!.address),
+                  subtitle: Text(
+                    _connectedDevice!.address +
+                        (_devInfoSerial != null
+                            ? '\nS/N: $_devInfoSerial  FW: $_devInfoFirmware'
+                            : ''),
+                  ),
+                  isThreeLine: _devInfoSerial != null,
                   trailing: FilledButton.tonal(
-                    onPressed: _disconnect,
+                    onPressed: _isDownloading ? null : _disconnect,
                     child: const Text('Disconnect'),
                   ),
                 ),
               ),
-              const SizedBox(height: 16),
-              // Placeholder for future dive download UI
-              Card(
-                child: ListTile(
-                  leading: const Icon(Icons.scuba_diving, color: Colors.blue),
-                  title: const Text('Dive Download'),
-                  subtitle: const Text(
-                    'Device connected and ready. Dive download coming in next iteration.',
+              const SizedBox(height: 8),
+
+              // Download button + progress
+              Row(
+                children: [
+                  FilledButton.icon(
+                    onPressed: _isDownloading ? null : _startDownload,
+                    icon: Icon(
+                      _isDownloading ? Icons.hourglass_top : Icons.download,
+                    ),
+                    label: Text(
+                      _isDownloading
+                          ? 'Downloading...'
+                          : _dives.isEmpty
+                          ? 'Download Dives'
+                          : 'Re-download',
+                    ),
                   ),
-                ),
+                  if (_isDownloading) ...[
+                    const SizedBox(width: 8),
+                    OutlinedButton.icon(
+                      onPressed: _cancelDownload,
+                      icon: const Icon(Icons.cancel),
+                      label: const Text('Cancel'),
+                    ),
+                  ],
+                  const SizedBox(width: 16),
+                  if (_isDownloading || _downloadProgress > 0)
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          LinearProgressIndicator(
+                            value: _isDownloading ? _downloadProgress : 1.0,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            _isDownloading
+                                ? '${(_downloadProgress * 100).toInt()}%  •  ${_dives.length} dives  •  ${_formatBytes(_downloadCurrent)} / ${_formatBytes(_downloadMaximum)}'
+                                : '${_dives.length} dives downloaded',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
               ),
+              const SizedBox(height: 16),
+
+              // Dive list header
+              if (_dives.isNotEmpty)
+                Text(
+                  'Dives (${_dives.length})',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              const SizedBox(height: 4),
             ],
 
-            // BLE Scan section (hidden when connected)
+            // BLE Scan section (when not connected)
             if (!_isConnected) ...[
               Row(
                 children: [
@@ -287,7 +417,6 @@ class _HomePageState extends State<HomePage> {
                 ],
               ),
               const SizedBox(height: 8),
-
               if (_discoveredDevices.isEmpty && _isScanning)
                 const Card(
                   child: ListTile(
@@ -311,20 +440,13 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ),
                 ),
-              if (_discoveredDevices.isNotEmpty) ...[
-                Text(
-                  'Discovered Devices (${_discoveredDevices.length})',
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-                const SizedBox(height: 4),
-              ],
             ],
 
-            // Device lists
+            // Scrollable content area
             Expanded(
               child: ListView(
                 children: [
-                  // Discovered BLE devices (hidden when connected)
+                  // Discovered BLE devices (when scanning)
                   if (!_isConnected)
                     ..._discoveredDevices.map(
                       (device) => Card(
@@ -359,39 +481,124 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
 
-                  // Separator
-                  if (!_isConnected &&
-                      _discoveredDevices.isNotEmpty &&
-                      _shearwaterDescriptors.isNotEmpty)
-                    const Divider(height: 32),
-
-                  // Shearwater models
-                  if (_shearwaterDescriptors.isNotEmpty && !_isConnected)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8.0),
-                      child: Text(
-                        'Shearwater Models (${_shearwaterDescriptors.length})',
-                        style: Theme.of(context).textTheme.titleMedium,
-                      ),
-                    ),
-                  if (!_isConnected)
-                    ..._shearwaterDescriptors.map(
-                      (desc) => ListTile(
-                        title: Text(desc.toString()),
-                        subtitle: Text(
-                          'Family: ${desc.family}, Model: ${desc.model}, '
-                          'BLE: ${desc.supportsBle ? "Yes" : "No"}',
-                        ),
-                        trailing: desc.supportsBle
-                            ? const Icon(Icons.bluetooth, color: Colors.blue)
-                            : const Icon(Icons.usb, color: Colors.grey),
-                      ),
-                    ),
+                  // Dive list (when connected and downloaded)
+                  if (_isConnected)
+                    ..._dives.map((dive) => _buildDiveCard(dive)),
                 ],
               ),
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  Widget _buildDiveCard(DcDive dive) {
+    final dateStr = dive.dateTime != null
+        ? '${dive.dateTime!.year}-${dive.dateTime!.month.toString().padLeft(2, '0')}-'
+              '${dive.dateTime!.day.toString().padLeft(2, '0')}  '
+              '${dive.dateTime!.hour.toString().padLeft(2, '0')}:'
+              '${dive.dateTime!.minute.toString().padLeft(2, '0')}'
+        : 'Unknown date';
+
+    final details = <String>[
+      dive.depthStr,
+      dive.timeStr,
+      if (dive.tempStr.isNotEmpty) dive.tempStr,
+      if (dive.diveMode != null) dive.diveMode!,
+      if (dive.gasStr.isNotEmpty) dive.gasStr,
+    ];
+
+    final sampleCount = dive.samples?.length ?? 0;
+
+    return Card(
+      child: ExpansionTile(
+        leading: CircleAvatar(
+          backgroundColor: Colors.blue.shade100,
+          child: Text(
+            '${dive.number}',
+            style: TextStyle(
+              color: Colors.blue.shade800,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        title: Text(dateStr),
+        subtitle: Text(details.join('  •  ')),
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _detailRow('Max Depth', dive.depthStr),
+                if (dive.avgDepth != null)
+                  _detailRow(
+                    'Avg Depth',
+                    '${dive.avgDepth!.toStringAsFixed(1)}m',
+                  ),
+                _detailRow('Duration', dive.timeStr),
+                if (dive.diveMode != null) _detailRow('Mode', dive.diveMode!),
+                if (dive.minTemperature != null)
+                  _detailRow(
+                    'Min Temp',
+                    '${dive.minTemperature!.toStringAsFixed(1)}°C',
+                  ),
+                if (dive.maxTemperature != null)
+                  _detailRow(
+                    'Max Temp',
+                    '${dive.maxTemperature!.toStringAsFixed(1)}°C',
+                  ),
+                if (dive.gasMixes != null && dive.gasMixes!.isNotEmpty)
+                  _detailRow('Gas', dive.gasStr),
+                if (dive.tanks != null && dive.tanks!.isNotEmpty)
+                  ...dive.tanks!.asMap().entries.map(
+                    (e) => _detailRow('Tank ${e.key + 1}', e.value.toString()),
+                  ),
+                _detailRow('Samples', '$sampleCount points'),
+                if (dive.fingerprint != null)
+                  _detailRow(
+                    'Fingerprint',
+                    '${dive.fingerprint!.substring(0, dive.fingerprint!.length > 16 ? 16 : dive.fingerprint!.length)}...',
+                  ),
+                if (dive.error != null)
+                  _detailRow('Error', dive.error!, isError: true),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _detailRow(String label, String value, {bool isError = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 100,
+            child: Text(
+              label,
+              style: TextStyle(
+                fontWeight: FontWeight.w500,
+                color: Colors.grey.shade600,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(color: isError ? Colors.red : null),
+            ),
+          ),
+        ],
       ),
     );
   }

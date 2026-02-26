@@ -185,6 +185,16 @@ class BLETransport: NSObject {
         receiveBuffer.removeAll()
         bufferLock.unlock()
     }
+
+    /// Drain any pending semaphore signals and clear the buffer.
+    /// Call before starting a new logical operation (e.g., download)
+    /// to prevent stale data from a previous exchange.
+    func prepareForNewOperation() {
+        clearBuffer()
+        // Drain any pending semaphore signals so reads block properly
+        while dataAvailable.wait(timeout: .now()) == .success {}
+        NSLog("[BLETransport] Buffer and semaphore reset for new operation")
+    }
 }
 
 // MARK: - CBPeripheralDelegate
@@ -230,15 +240,18 @@ extension BLETransport: CBPeripheralDelegate {
                 }
 
                 // Look for a writable characteristic (TX — data to device)
+                // Prefer writeWithoutResponse for BLE UART — most dive computers
+                // (including Shearwater) expect this for throughput and may not
+                // properly acknowledge write-with-response.
                 if txCharacteristic == nil {
-                    if char.properties.contains(.write) {
-                        txCharacteristic = char
-                        writeType = .withResponse
-                        NSLog("[BLETransport]   → TX (write with response): \(char.uuid)")
-                    } else if char.properties.contains(.writeWithoutResponse) {
+                    if char.properties.contains(.writeWithoutResponse) {
                         txCharacteristic = char
                         writeType = .withoutResponse
                         NSLog("[BLETransport]   → TX (write without response): \(char.uuid)")
+                    } else if char.properties.contains(.write) {
+                        txCharacteristic = char
+                        writeType = .withResponse
+                        NSLog("[BLETransport]   → TX (write with response): \(char.uuid)")
                     }
                 }
             }
@@ -390,7 +403,9 @@ private let bleRead: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawP
         deadline = .now() + .milliseconds(timeoutMs)
     }
 
-    // Blocking or timeout read: accumulate bytes until we have `size` or timeout
+    // Blocking or timeout read: wait for at least SOME data, then return
+    // what's available (like POSIX read on a socket — returns up to `size`
+    // bytes, not exactly `size` bytes).
     while totalRead < size {
         // Check if we already have data buffered
         let available = t.bufferedByteCount
@@ -400,17 +415,20 @@ private let bleRead: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawP
             let dest = data.assumingMemoryBound(to: UInt8.self).advanced(by: totalRead)
             chunk.copyBytes(to: dest, count: chunk.count)
             totalRead += chunk.count
-            continue
+            // Return immediately with whatever we got — don't block
+            // waiting for more. The caller will call read again if needed.
+            break
         }
 
         if t.isClosed { break }
 
-        // Wait for more data
+        // No data at all yet — wait for the first notification
         let remaining = deadline == .distantFuture ? .distantFuture : deadline
         let waitResult = t.dataAvailable.wait(timeout: remaining)
 
         if t.isClosed { break }
         if waitResult == .timedOut { break }
+        // Data arrived — loop back to drain it
     }
 
     actual.pointee = totalRead
@@ -431,13 +449,16 @@ private let bleWrite: @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer
         let chunkSize = min(mtu, writeData.count - offset)
         let chunk = writeData.subdata(in: offset..<(offset + chunkSize))
 
-        // Dispatch the write to the main queue since CoreBluetooth may require it
-        DispatchQueue.main.async {
-            t.peripheral.writeValue(chunk, for: t.txCharacteristic!, type: t.writeType)
-        }
-
         if t.writeType == .withResponse {
-            // Wait for write completion callback
+            // Synchronously dispatch write and wait for device acknowledgment
+            let writeDone = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                t.peripheral.writeValue(chunk, for: t.txCharacteristic!, type: .withResponse)
+                writeDone.signal()
+            }
+            writeDone.wait()
+
+            // Wait for write completion callback from CoreBluetooth
             let result = t.writeComplete.wait(timeout: .now() + .seconds(5))
             if result == .timedOut {
                 NSLog("[BLETransport] Write timeout")
@@ -450,8 +471,14 @@ private let bleWrite: @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer
                 return DC_STATUS_IO
             }
         } else {
-            // For writeWithoutResponse, add a small delay for flow control
-            usleep(5000) // 5ms
+            // writeWithoutResponse: synchronously dispatch to main queue,
+            // wait for it to actually execute before continuing
+            let writeDone = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                t.peripheral.writeValue(chunk, for: t.txCharacteristic!, type: .withoutResponse)
+                writeDone.signal()
+            }
+            writeDone.wait()
         }
 
         offset += chunkSize

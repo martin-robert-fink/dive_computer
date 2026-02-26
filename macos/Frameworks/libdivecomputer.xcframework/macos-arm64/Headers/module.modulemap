@@ -10,6 +10,7 @@ module LibDiveComputer [system] {
     header "libdivecomputer/iterator.h"
     header "libdivecomputer/ble.h"
     header "libdivecomputer/buffer.h"
+    header "libdivecomputer/datetime.h"
     header "libdivecomputer/version.h"
     export *
 }

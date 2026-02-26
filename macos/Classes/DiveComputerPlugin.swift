@@ -26,6 +26,9 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
     private var dcDevice: OpaquePointer?        // dc_device_t*
     private var dcDescriptor: OpaquePointer?    // dc_descriptor_t* (for connected device)
 
+    // Active download
+    private var diveDownloader: DiveDownloader?
+
     init(channel: FlutterMethodChannel) {
         self.methodChannel = channel
         super.init()
@@ -117,7 +120,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             return
         }
 
-        // 1. Find the CBPeripheral
         guard let peripheral = discoveredPeripherals[address] else {
             result(FlutterError(code: "NO_DEVICE", message: "Device not found. Try scanning again.", details: nil))
             return
@@ -125,7 +127,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
 
         let deviceName = discoveredDeviceNames[address] ?? peripheral.name ?? "Unknown"
 
-        // 2. Find the matching libdivecomputer descriptor
         guard let descriptor = bleManager.findDescriptor(vendor: vendor, product: product) else {
             result(FlutterError(code: "NO_DESCRIPTOR", message: "No libdivecomputer descriptor for \(vendor) \(product)", details: nil))
             return
@@ -134,7 +135,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
 
         NSLog("[Plugin] Connecting to \(vendor) \(product) (\(deviceName)) at \(address)")
 
-        // 3. Connect via CoreBluetooth
         bleManager.connect(peripheral: peripheral) { [weak self] success, error in
             guard let self = self else { return }
 
@@ -144,7 +144,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            // 4. Create BLETransport and discover services/characteristics
             let transport = BLETransport(peripheral: peripheral, name: deviceName)
             self.bleTransport = transport
 
@@ -157,8 +156,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
                     return
                 }
 
-                // 5. Open dc_device on a background thread
-                //    (libdivecomputer does synchronous I/O — must not block main thread)
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self = self else { return }
                     let openResult = self.openDiveComputerDevice(descriptor: descriptor, transport: transport)
@@ -179,9 +176,7 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
         }
     }
 
-    /// Creates dc_context and opens the dc_device. Called on a background thread.
     private func openDiveComputerDevice(descriptor: OpaquePointer, transport: BLETransport) -> Bool {
-        // Create context
         var context: OpaquePointer?
         var status = dc_context_new(&context)
         guard status == DC_STATUS_SUCCESS, let ctx = context else {
@@ -190,7 +185,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
         }
         self.dcContext = ctx
 
-        // Enable debug logging
         dc_context_set_loglevel(ctx, DC_LOGLEVEL_WARNING)
         dc_context_set_logfunc(ctx, { _, loglevel, file, line, function, message, _ in
             guard let message = message else { return }
@@ -206,7 +200,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             NSLog("[libdivecomputer] [\(level)] \(msg)")
         }, nil)
 
-        // Open device
         guard let iostream = transport.iostream else {
             NSLog("[Plugin] No iostream available")
             return false
@@ -224,9 +217,48 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
         return true
     }
 
+    // MARK: - Download
+
+    func startDownload() {
+        guard let device = dcDevice else {
+            NSLog("[Plugin] Cannot download — no device connected")
+            downloadEventSink?(FlutterError(
+                code: "NO_DEVICE",
+                message: "No dive computer connected",
+                details: nil
+            ))
+            return
+        }
+
+        NSLog("[Plugin] Starting dive download")
+
+        // Purge any stale data that arrived between connect and download
+        bleTransport?.prepareForNewOperation()
+
+        let downloader = DiveDownloader(device: device) { [weak self] event in
+            guard let self = self else { return }
+            self.downloadEventSink?(event)
+
+            // End the stream when download completes
+            if let type = event["type"] as? String, type == "complete" {
+                self.downloadEventSink?(FlutterEndOfEventStream)
+                self.diveDownloader = nil
+            }
+        }
+
+        self.diveDownloader = downloader
+        downloader.start()
+    }
+
+    func cancelDownload() {
+        diveDownloader?.cancel()
+        diveDownloader = nil
+    }
+
     // MARK: - Disconnection
 
     private func handleDisconnect(result: @escaping FlutterResult) {
+        cancelDownload()
         cleanupConnection()
         bleManager.disconnect {
             result(nil)
@@ -234,26 +266,22 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
     }
 
     private func cleanupConnection() {
-        // Close device first (uses the iostream)
         if let device = dcDevice {
             dc_device_close(device)
             dcDevice = nil
             NSLog("[Plugin] dc_device closed")
         }
 
-        // Close iostream (signals transport to stop)
         if let iostream = bleTransport?.iostream {
             dc_iostream_close(iostream)
         }
         bleTransport = nil
 
-        // Free context
         if let context = dcContext {
             dc_context_free(context)
             dcContext = nil
         }
 
-        // Free descriptor
         if let descriptor = dcDescriptor {
             dc_descriptor_free(descriptor)
             dcDescriptor = nil
@@ -327,10 +355,12 @@ class DownloadStreamHandler: NSObject, FlutterStreamHandler {
 
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         plugin?.setDownloadEventSink(events)
+        plugin?.startDownload()
         return nil
     }
 
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        plugin?.cancelDownload()
         plugin?.setDownloadEventSink(nil)
         return nil
     }
