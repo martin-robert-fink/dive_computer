@@ -1,0 +1,12 @@
+module LibDiveComputer [system] {
+    header "libdivecomputer/common.h"
+    header "libdivecomputer/context.h"
+    header "libdivecomputer/descriptor.h"
+    header "libdivecomputer/device.h"
+    header "libdivecomputer/iostream.h"
+    header "libdivecomputer/parser.h"
+    header "libdivecomputer/iterator.h"
+    header "libdivecomputer/ble.h"
+    header "libdivecomputer/version.h"
+    export *
+}
