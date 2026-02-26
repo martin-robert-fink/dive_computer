@@ -7,6 +7,15 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
     private let methodChannel: FlutterMethodChannel
     private var scanEventSink: FlutterEventSink?
     private var downloadEventSink: FlutterEventSink?
+    lazy var bleManager: BLEManager = {
+        let manager = BLEManager()
+        manager.delegate = self
+        return manager
+    }()
+
+    /// Keep strong references to discovered peripherals so CoreBluetooth
+    /// doesn't deallocate them before we connect.
+    private var discoveredPeripherals: [String: CBPeripheral] = [:]
 
     init(channel: FlutterMethodChannel) {
         self.methodChannel = channel
@@ -42,6 +51,7 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
         case "getSupportedDescriptors":
             result(getSupportedDescriptors())
         case "stopScan":
+            bleManager.stopScan()
             result(nil)
         case "connectToDevice":
             result(FlutterError(code: "NOT_IMPLEMENTED", message: "Connection not yet implemented", details: nil))
@@ -51,6 +61,8 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             result(FlutterMethodNotImplemented)
         }
     }
+
+    // MARK: - libdivecomputer queries
 
     private func getLibraryVersion() -> String {
         var version = dc_version_t()
@@ -85,6 +97,13 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
         return descriptors
     }
 
+    // MARK: - Scan lifecycle
+
+    func startScan() {
+        discoveredPeripherals.removeAll()
+        bleManager.startScan()
+    }
+
     func setScanEventSink(_ sink: FlutterEventSink?) {
         self.scanEventSink = sink
     }
@@ -94,14 +113,46 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
     }
 }
 
+// MARK: - BLEManagerDelegate
+
+extension DiveComputerPlugin: BLEManagerDelegate {
+
+    func bleManager(_ manager: BLEManager, didDiscoverDevice device: DiscoveredDevice) {
+        // Hold a strong reference to the peripheral
+        discoveredPeripherals[device.peripheral.identifier.uuidString] = device.peripheral
+        // Send to Flutter via the scan EventChannel
+        scanEventSink?(device.toMap)
+    }
+
+    func bleManager(_ manager: BLEManager, didUpdateState state: CBManagerState) {
+        if state == .poweredOn {
+            NSLog("[DiveComputerPlugin] Bluetooth ready")
+        }
+    }
+
+    func bleManager(_ manager: BLEManager, didFailWithError message: String) {
+        scanEventSink?(FlutterError(
+            code: "BLE_ERROR",
+            message: message,
+            details: nil
+        ))
+    }
+}
+
+// MARK: - Stream Handlers
+
 class ScanStreamHandler: NSObject, FlutterStreamHandler {
     weak var plugin: DiveComputerPlugin?
     init(plugin: DiveComputerPlugin) { self.plugin = plugin }
+
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         plugin?.setScanEventSink(events)
+        plugin?.startScan()
         return nil
     }
+
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        plugin?.bleManager.stopScan()
         plugin?.setScanEventSink(nil)
         return nil
     }
@@ -110,10 +161,12 @@ class ScanStreamHandler: NSObject, FlutterStreamHandler {
 class DownloadStreamHandler: NSObject, FlutterStreamHandler {
     weak var plugin: DiveComputerPlugin?
     init(plugin: DiveComputerPlugin) { self.plugin = plugin }
+
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         plugin?.setDownloadEventSink(events)
         return nil
     }
+
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
         plugin?.setDownloadEventSink(nil)
         return nil
