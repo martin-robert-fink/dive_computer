@@ -47,9 +47,9 @@ class _HomePageState extends State<HomePage> {
 
   // Download state
   bool _isDownloading = false;
+  bool _forceDownload = false;
   double _downloadProgress = 0;
-  int _downloadCurrent = 0;
-  int _downloadMaximum = 0;
+  int? _totalDiveCount;
   final List<DcDive> _dives = [];
   StreamSubscription<Map<String, dynamic>>? _downloadSubscription;
   int? _devInfoSerial;
@@ -168,8 +168,7 @@ class _HomePageState extends State<HomePage> {
       _connectedDevice = null;
       _dives.clear();
       _downloadProgress = 0;
-      _downloadCurrent = 0;
-      _downloadMaximum = 0;
+      _totalDiveCount = null;
       _devInfoSerial = null;
       _devInfoFirmware = null;
       _statusMessage = 'Disconnected';
@@ -187,64 +186,84 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  Future<void> _resetFingerprint() async {
+    await _plugin.resetFingerprint();
+    setState(() {
+      _statusMessage = 'Fingerprint reset — next download will fetch all dives';
+    });
+  }
+
   void _startDownload() {
     setState(() {
       _isDownloading = true;
       _downloadProgress = 0;
-      _downloadCurrent = 0;
-      _downloadMaximum = 0;
+      _totalDiveCount = null;
       _dives.clear();
       _devInfoSerial = null;
       _devInfoFirmware = null;
       _statusMessage = 'Downloading dives...';
     });
 
-    _downloadSubscription = _plugin.downloadDives().listen(
-      (event) {
-        final type = event['type'] as String?;
+    _downloadSubscription = _plugin
+        .downloadDives(forceDownload: _forceDownload)
+        .listen(
+          (event) {
+            final type = event['type'] as String?;
 
-        switch (type) {
-          case 'progress':
-            final current = event['current'] as int? ?? 0;
-            final maximum = event['maximum'] as int? ?? 1;
-            setState(() {
-              _downloadCurrent = current;
-              _downloadMaximum = maximum;
-              _downloadProgress = maximum > 0 ? current / maximum : 0;
-            });
+            switch (type) {
+              case 'progress':
+                final current = event['current'] as int? ?? 0;
+                final maximum = event['maximum'] as int? ?? 1;
+                setState(() {
+                  _downloadProgress = maximum > 0 ? current / maximum : 0;
+                });
 
-          case 'devinfo':
-            setState(() {
-              _devInfoSerial = event['serial'] as int?;
-              _devInfoFirmware = event['firmware'] as int?;
-            });
+              case 'devinfo':
+                setState(() {
+                  _devInfoSerial = event['serial'] as int?;
+                  _devInfoFirmware = event['firmware'] as int?;
+                });
 
-          case 'dive':
-            final dive = DcDive.fromMap(event);
-            setState(() {
-              _dives.add(dive);
-              _statusMessage = 'Downloaded ${_dives.length} dives...';
-            });
+              case 'totalDives':
+                setState(() {
+                  _totalDiveCount = event['totalDives'] as int?;
+                  if (_totalDiveCount != null) {
+                    _statusMessage =
+                        'Found $_totalDiveCount dives, downloading...';
+                  }
+                });
 
-          case 'complete':
-            final total = event['totalDives'] as int? ?? _dives.length;
+              case 'dive':
+                final dive = DcDive.fromMap(event);
+                // Also pick up totalDives from individual dive events
+                final total = event['totalDives'] as int?;
+                setState(() {
+                  _dives.add(dive);
+                  if (total != null) _totalDiveCount = total;
+                  _statusMessage = _totalDiveCount != null
+                      ? 'Downloaded ${_dives.length} of $_totalDiveCount dives...'
+                      : 'Downloaded ${_dives.length} dives...';
+                });
+
+              case 'complete':
+                final total = event['totalDives'] as int? ?? _dives.length;
+                setState(() {
+                  _isDownloading = false;
+                  _downloadProgress = 1.0;
+                  _statusMessage = 'Download complete: $total dives';
+                });
+            }
+          },
+          onError: (error) {
             setState(() {
               _isDownloading = false;
-              _downloadProgress = 1.0;
-              _statusMessage = 'Download complete: $total dives';
+              _statusMessage = 'Download error: $error';
             });
-        }
-      },
-      onError: (error) {
-        setState(() {
-          _isDownloading = false;
-          _statusMessage = 'Download error: $error';
-        });
-      },
-      onDone: () {
-        setState(() => _isDownloading = false);
-      },
-    );
+          },
+          onDone: () {
+            setState(() => _isDownloading = false);
+          },
+        );
   }
 
   // MARK: - Build
@@ -367,13 +386,36 @@ class _HomePageState extends State<HomePage> {
                           const SizedBox(height: 4),
                           Text(
                             _isDownloading
-                                ? '${(_downloadProgress * 100).toInt()}%  •  ${_dives.length} dives  •  ${_formatBytes(_downloadCurrent)} / ${_formatBytes(_downloadMaximum)}'
+                                ? '${(_downloadProgress * 100).toInt()}%  •  ${_dives.length}${_totalDiveCount != null ? ' of ~$_totalDiveCount' : ''} dives'
                                 : '${_dives.length} dives downloaded',
                             style: Theme.of(context).textTheme.bodySmall,
                           ),
                         ],
                       ),
                     ),
+                ],
+              ),
+              const SizedBox(height: 4),
+
+              // Download options
+              Row(
+                children: [
+                  SizedBox(
+                    height: 32,
+                    child: FilterChip(
+                      label: const Text('Force full download'),
+                      selected: _forceDownload,
+                      onSelected: _isDownloading
+                          ? null
+                          : (value) => setState(() => _forceDownload = value),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton.icon(
+                    onPressed: _isDownloading ? null : _resetFingerprint,
+                    icon: const Icon(Icons.delete_outline, size: 18),
+                    label: const Text('Reset Fingerprint'),
+                  ),
                 ],
               ),
               const SizedBox(height: 16),
@@ -491,12 +533,6 @@ class _HomePageState extends State<HomePage> {
         ),
       ),
     );
-  }
-
-  String _formatBytes(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 
   Widget _buildDiveCard(DcDive dive) {

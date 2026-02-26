@@ -11,12 +11,25 @@ class DiveDownloader {
 
     private let device: OpaquePointer     // dc_device_t*
     private let onEvent: DownloadEventCallback
+    private let forceDownload: Bool
 
+    fileprivate var deviceSerial: UInt32? = nil
     fileprivate var diveCount = 0
     fileprivate var isCancelled = false
 
-    init(device: OpaquePointer, onEvent: @escaping DownloadEventCallback) {
+    /// Estimated total number of dives, derived from progress when first dive arrives.
+    fileprivate var estimatedTotalDives: Int? = nil
+
+    /// Track progress state for dive count estimation
+    fileprivate var lastProgressCurrent: Int = 0
+    fileprivate var lastProgressMaximum: Int = 0
+
+    /// Whether we've received devinfo (and set fingerprint)
+    fileprivate var devInfoReceived = false
+
+    init(device: OpaquePointer, forceDownload: Bool = false, onEvent: @escaping DownloadEventCallback) {
         self.device = device
+        self.forceDownload = forceDownload
         self.onEvent = onEvent
     }
 
@@ -59,11 +72,54 @@ class DiveDownloader {
 
         NSLog("[DiveDownloader] Download finished: \(statusName), \(diveCount) dives")
 
+        // Save fingerprint on successful download
+        if status == DC_STATUS_SUCCESS || status == DC_STATUS_DONE {
+            // Fingerprint is saved during dive processing (from first dive)
+        }
+
         sendEvent([
             "type": "complete",
             "totalDives": diveCount,
             "status": statusName,
         ])
+    }
+
+    // MARK: - Fingerprint Persistence
+
+    /// Called from the DEVINFO event handler to load and set the saved
+    /// fingerprint. This enables incremental downloads — libdivecomputer
+    /// will stop at the previously-downloaded dive.
+    fileprivate func loadAndSetFingerprint(serial: UInt32) {
+        if forceDownload {
+            NSLog("[DiveDownloader] Force download — skipping saved fingerprint")
+            return
+        }
+
+        guard let fpData = FingerprintStore.load(serial: serial) else {
+            NSLog("[DiveDownloader] No saved fingerprint for serial \(serial)")
+            return
+        }
+
+        let status = fpData.withUnsafeBytes { ptr -> dc_status_t in
+            guard let baseAddress = ptr.baseAddress else { return DC_STATUS_INVALIDARGS }
+            return dc_device_set_fingerprint(
+                device,
+                baseAddress.assumingMemoryBound(to: UInt8.self),
+                UInt32(fpData.count)
+            )
+        }
+
+        if status == DC_STATUS_SUCCESS {
+            NSLog("[DiveDownloader] Loaded fingerprint for serial \(serial): \(fpData.map { String(format: "%02x", $0) }.joined())")
+        } else {
+            NSLog("[DiveDownloader] Failed to set fingerprint: \(status.rawValue)")
+        }
+    }
+
+    /// Save the fingerprint from the first (newest) dive for next time.
+    fileprivate func saveFingerprint(_ data: Data, serial: UInt32) {
+        FingerprintStore.save(serial: serial, fingerprint: data)
+        NSLog("[DiveDownloader] Saved fingerprint for serial \(serial): \(data.map { String(format: "%02x", $0) }.joined())")
     }
 
     // MARK: - Event Sending (thread-safe to main queue)
@@ -79,6 +135,28 @@ class DiveDownloader {
     fileprivate func processDive(data: UnsafePointer<UInt8>, size: UInt32,
                                   fingerprint: UnsafePointer<UInt8>?, fpSize: UInt32) -> Bool {
         diveCount += 1
+
+        // Estimate total dives when the first dive arrives.
+        // At this point, the manifest phase is complete and lastProgressMaximum
+        // is stable. For Shearwater: max = NSTEPS(10000) * (manifest_pages + dive_count).
+        // Using max/10000 gives a close approximation (off by a few manifest pages).
+        if diveCount == 1 && lastProgressMaximum > 0 {
+            let totalSteps = lastProgressMaximum / 10000
+            if totalSteps > 0 {
+                estimatedTotalDives = totalSteps
+                NSLog("[DiveDownloader] Estimated total dives: ~\(totalSteps) (from progress max=\(lastProgressMaximum))")
+                sendEvent([
+                    "type": "totalDives",
+                    "totalDives": totalSteps,
+                ])
+            }
+        }
+
+        // Save fingerprint from the first (newest) dive for incremental downloads
+        if diveCount == 1, let fp = fingerprint, fpSize > 0, let serial = deviceSerial {
+            let fpData = Data(bytes: fp, count: Int(fpSize))
+            saveFingerprint(fpData, serial: serial)
+        }
 
         var parser: OpaquePointer?
         let status = dc_parser_new(&parser, device, data, Int(size))
@@ -99,6 +177,11 @@ class DiveDownloader {
             "type": "dive",
             "number": diveCount,
         ]
+
+        // Include estimated total if known
+        if let total = estimatedTotalDives {
+            diveEvent["totalDives"] = total
+        }
 
         // DateTime
         var datetime = dc_datetime_t()
@@ -231,11 +314,50 @@ class DiveDownloader {
             diveEvent["fingerprint"] = fpData.map { String(format: "%02x", $0) }.joined()
         }
 
-        NSLog("[DiveDownloader] Dive #\(diveCount): depth=\(diveEvent["maxDepth"] ?? "?")m, " +
+        NSLog("[DiveDownloader] Dive #\(diveCount)\(estimatedTotalDives != nil ? "/\(estimatedTotalDives!)" : ""): " +
+              "depth=\(diveEvent["maxDepth"] ?? "?")m, " +
               "time=\(diveEvent["diveTime"] ?? "?")s, samples=\(sampleCollector.samples.count)")
 
         sendEvent(diveEvent)
         return true // Continue to next dive
+    }
+}
+
+// MARK: - Fingerprint Store
+
+/// Persists dive fingerprints to disk, keyed by device serial number.
+/// Used for incremental downloads — only new dives since the last
+/// download are transferred.
+struct FingerprintStore {
+
+    private static var directory: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("DiveComputer/fingerprints", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    static func save(serial: UInt32, fingerprint: Data) {
+        let file = directory.appendingPathComponent("\(serial).fp")
+        try? fingerprint.write(to: file)
+    }
+
+    static func load(serial: UInt32) -> Data? {
+        let file = directory.appendingPathComponent("\(serial).fp")
+        return try? Data(contentsOf: file)
+    }
+
+    static func delete(serial: UInt32) {
+        let file = directory.appendingPathComponent("\(serial).fp")
+        try? FileManager.default.removeItem(at: file)
+    }
+
+    static func deleteAll() {
+        let dir = directory
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
+        for file in files where file.pathExtension == "fp" {
+            try? FileManager.default.removeItem(at: file)
+        }
     }
 }
 
@@ -266,20 +388,39 @@ private let deviceEventCallback: @convention(c)
     switch event {
     case DC_EVENT_PROGRESS:
         let progress = data.assumingMemoryBound(to: dc_event_progress_t.self).pointee
+        let current = Int(progress.current)
+        let maximum = Int(progress.maximum)
+
+        // Track latest progress values for dive count estimation
+        downloader.lastProgressCurrent = current
+        downloader.lastProgressMaximum = maximum
+
         downloader.sendEvent([
             "type": "progress",
-            "current": Int(progress.current),
-            "maximum": Int(progress.maximum),
+            "current": current,
+            "maximum": maximum,
         ])
 
     case DC_EVENT_DEVINFO:
         let devinfo = data.assumingMemoryBound(to: dc_event_devinfo_t.self).pointee
-        NSLog("[DiveDownloader] DevInfo: model=\(devinfo.model) fw=\(devinfo.firmware) serial=\(devinfo.serial)")
+        let serial = devinfo.serial
+        NSLog("[DiveDownloader] DevInfo: model=\(devinfo.model) fw=\(devinfo.firmware) serial=\(serial)")
+
+        downloader.devInfoReceived = true
+
+        // Store serial for fingerprint saving during dive processing
+        downloader.deviceSerial = serial
+
+        // Load and set saved fingerprint for incremental download
+        // This MUST happen during DEVINFO, before manifest processing begins
+        // (matching Subsurface's approach)
+        downloader.loadAndSetFingerprint(serial: serial)
+
         downloader.sendEvent([
             "type": "devinfo",
             "model": Int(devinfo.model),
             "firmware": Int(devinfo.firmware),
-            "serial": Int(devinfo.serial),
+            "serial": Int(serial),
         ])
 
     default:

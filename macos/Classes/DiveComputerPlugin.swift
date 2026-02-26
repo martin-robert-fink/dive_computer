@@ -69,6 +69,8 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             handleConnect(call: call, result: result)
         case "disconnect":
             handleDisconnect(result: result)
+        case "resetFingerprint":
+            handleResetFingerprint(result: result)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -219,7 +221,7 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
 
     // MARK: - Download
 
-    func startDownload() {
+    func startDownload(forceDownload: Bool = false) {
         guard let device = dcDevice else {
             NSLog("[Plugin] Cannot download — no device connected")
             downloadEventSink?(FlutterError(
@@ -230,12 +232,12 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             return
         }
 
-        NSLog("[Plugin] Starting dive download")
+        NSLog("[Plugin] Starting dive download (forceDownload=\(forceDownload))")
 
         // Purge any stale data that arrived between connect and download
         bleTransport?.prepareForNewOperation()
 
-        let downloader = DiveDownloader(device: device) { [weak self] event in
+        let downloader = DiveDownloader(device: device, forceDownload: forceDownload) { [weak self] event in
             guard let self = self else { return }
             self.downloadEventSink?(event)
 
@@ -253,6 +255,14 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
     func cancelDownload() {
         diveDownloader?.cancel()
         diveDownloader = nil
+    }
+
+    // MARK: - Fingerprint Management
+
+    private func handleResetFingerprint(result: @escaping FlutterResult) {
+        FingerprintStore.deleteAll()
+        NSLog("[Plugin] All saved fingerprints deleted")
+        result(true)
     }
 
     // MARK: - Disconnection
@@ -354,8 +364,13 @@ class DownloadStreamHandler: NSObject, FlutterStreamHandler {
     init(plugin: DiveComputerPlugin) { self.plugin = plugin }
 
     func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
+        var forceDownload = false
+        if let args = arguments as? [String: Any],
+           let force = args["forceDownload"] as? Bool {
+            forceDownload = force
+        }
         plugin?.setDownloadEventSink(events)
-        plugin?.startDownload()
+        plugin?.startDownload(forceDownload: forceDownload)
         return nil
     }
 

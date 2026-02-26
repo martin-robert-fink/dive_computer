@@ -51,10 +51,14 @@ class DiveComputerPlugin {
     return result ?? false;
   }
 
-  Stream<Map<String, dynamic>> downloadDives() {
-    return _downloadChannel.receiveBroadcastStream().map(
-      (event) => Map<String, dynamic>.from(event as Map),
-    );
+  Stream<Map<String, dynamic>> downloadDives({bool forceDownload = false}) {
+    return _downloadChannel
+        .receiveBroadcastStream({'forceDownload': forceDownload})
+        .map((event) => Map<String, dynamic>.from(event as Map));
+  }
+
+  Future<void> resetFingerprint() async {
+    await _channel.invokeMethod('resetFingerprint');
   }
 
   Future<void> disconnect() async {
