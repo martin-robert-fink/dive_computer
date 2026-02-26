@@ -17,6 +17,15 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
     /// doesn't deallocate them before we connect.
     private var discoveredPeripherals: [String: CBPeripheral] = [:]
 
+    /// Track the advertised name for each peripheral (for dc_descriptor_filter matching)
+    private var discoveredDeviceNames: [String: String] = [:]
+
+    // Active connection state
+    private var bleTransport: BLETransport?
+    private var dcContext: OpaquePointer?       // dc_context_t*
+    private var dcDevice: OpaquePointer?        // dc_device_t*
+    private var dcDescriptor: OpaquePointer?    // dc_descriptor_t* (for connected device)
+
     init(channel: FlutterMethodChannel) {
         self.methodChannel = channel
         super.init()
@@ -54,9 +63,9 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             bleManager.stopScan()
             result(nil)
         case "connectToDevice":
-            result(FlutterError(code: "NOT_IMPLEMENTED", message: "Connection not yet implemented", details: nil))
+            handleConnect(call: call, result: result)
         case "disconnect":
-            result(nil)
+            handleDisconnect(result: result)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -97,10 +106,165 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
         return descriptors
     }
 
+    // MARK: - Connection
+
+    private func handleConnect(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let address = args["address"] as? String,
+              let vendor = args["vendor"] as? String,
+              let product = args["product"] as? String else {
+            result(FlutterError(code: "INVALID_ARGS", message: "Missing address, vendor, or product", details: nil))
+            return
+        }
+
+        // 1. Find the CBPeripheral
+        guard let peripheral = discoveredPeripherals[address] else {
+            result(FlutterError(code: "NO_DEVICE", message: "Device not found. Try scanning again.", details: nil))
+            return
+        }
+
+        let deviceName = discoveredDeviceNames[address] ?? peripheral.name ?? "Unknown"
+
+        // 2. Find the matching libdivecomputer descriptor
+        guard let descriptor = bleManager.findDescriptor(vendor: vendor, product: product) else {
+            result(FlutterError(code: "NO_DESCRIPTOR", message: "No libdivecomputer descriptor for \(vendor) \(product)", details: nil))
+            return
+        }
+        self.dcDescriptor = descriptor
+
+        NSLog("[Plugin] Connecting to \(vendor) \(product) (\(deviceName)) at \(address)")
+
+        // 3. Connect via CoreBluetooth
+        bleManager.connect(peripheral: peripheral) { [weak self] success, error in
+            guard let self = self else { return }
+
+            guard success else {
+                self.cleanupConnection()
+                result(FlutterError(code: "CONNECT_FAILED", message: error ?? "Connection failed", details: nil))
+                return
+            }
+
+            // 4. Create BLETransport and discover services/characteristics
+            let transport = BLETransport(peripheral: peripheral, name: deviceName)
+            self.bleTransport = transport
+
+            transport.setup(context: nil) { [weak self] ready, setupError in
+                guard let self = self else { return }
+
+                guard ready else {
+                    self.cleanupConnection()
+                    result(FlutterError(code: "SETUP_FAILED", message: setupError ?? "BLE setup failed", details: nil))
+                    return
+                }
+
+                // 5. Open dc_device on a background thread
+                //    (libdivecomputer does synchronous I/O — must not block main thread)
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+                    let openResult = self.openDiveComputerDevice(descriptor: descriptor, transport: transport)
+
+                    DispatchQueue.main.async {
+                        if openResult {
+                            NSLog("[Plugin] Device opened successfully!")
+                            result(true)
+                        } else {
+                            self.cleanupConnection()
+                            result(FlutterError(code: "DEVICE_OPEN_FAILED",
+                                                message: "Failed to open dive computer device",
+                                                details: nil))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Creates dc_context and opens the dc_device. Called on a background thread.
+    private func openDiveComputerDevice(descriptor: OpaquePointer, transport: BLETransport) -> Bool {
+        // Create context
+        var context: OpaquePointer?
+        var status = dc_context_new(&context)
+        guard status == DC_STATUS_SUCCESS, let ctx = context else {
+            NSLog("[Plugin] dc_context_new failed: \(status.rawValue)")
+            return false
+        }
+        self.dcContext = ctx
+
+        // Enable debug logging
+        dc_context_set_loglevel(ctx, DC_LOGLEVEL_WARNING)
+        dc_context_set_logfunc(ctx, { _, loglevel, file, line, function, message, _ in
+            guard let message = message else { return }
+            let msg = String(cString: message)
+            let level: String
+            switch loglevel {
+            case DC_LOGLEVEL_ERROR:   level = "ERROR"
+            case DC_LOGLEVEL_WARNING: level = "WARN"
+            case DC_LOGLEVEL_INFO:    level = "INFO"
+            case DC_LOGLEVEL_DEBUG:   level = "DEBUG"
+            default:                  level = "???"
+            }
+            NSLog("[libdivecomputer] [\(level)] \(msg)")
+        }, nil)
+
+        // Open device
+        guard let iostream = transport.iostream else {
+            NSLog("[Plugin] No iostream available")
+            return false
+        }
+
+        var device: OpaquePointer?
+        status = dc_device_open(&device, ctx, descriptor, iostream)
+        guard status == DC_STATUS_SUCCESS, device != nil else {
+            NSLog("[Plugin] dc_device_open failed: \(status.rawValue)")
+            return false
+        }
+        self.dcDevice = device
+
+        NSLog("[Plugin] dc_device_open succeeded")
+        return true
+    }
+
+    // MARK: - Disconnection
+
+    private func handleDisconnect(result: @escaping FlutterResult) {
+        cleanupConnection()
+        bleManager.disconnect {
+            result(nil)
+        }
+    }
+
+    private func cleanupConnection() {
+        // Close device first (uses the iostream)
+        if let device = dcDevice {
+            dc_device_close(device)
+            dcDevice = nil
+            NSLog("[Plugin] dc_device closed")
+        }
+
+        // Close iostream (signals transport to stop)
+        if let iostream = bleTransport?.iostream {
+            dc_iostream_close(iostream)
+        }
+        bleTransport = nil
+
+        // Free context
+        if let context = dcContext {
+            dc_context_free(context)
+            dcContext = nil
+        }
+
+        // Free descriptor
+        if let descriptor = dcDescriptor {
+            dc_descriptor_free(descriptor)
+            dcDescriptor = nil
+        }
+    }
+
     // MARK: - Scan lifecycle
 
     func startScan() {
         discoveredPeripherals.removeAll()
+        discoveredDeviceNames.removeAll()
         bleManager.startScan()
     }
 
@@ -118,9 +282,8 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
 extension DiveComputerPlugin: BLEManagerDelegate {
 
     func bleManager(_ manager: BLEManager, didDiscoverDevice device: DiscoveredDevice) {
-        // Hold a strong reference to the peripheral
         discoveredPeripherals[device.peripheral.identifier.uuidString] = device.peripheral
-        // Send to Flutter via the scan EventChannel
+        discoveredDeviceNames[device.peripheral.identifier.uuidString] = device.name
         scanEventSink?(device.toMap)
     }
 

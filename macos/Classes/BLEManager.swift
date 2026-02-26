@@ -32,8 +32,8 @@ protocol BLEManagerDelegate: AnyObject {
     func bleManager(_ manager: BLEManager, didFailWithError message: String)
 }
 
-/// Manages CoreBluetooth scanning and filters discovered peripherals
-/// against libdivecomputer's known device descriptors.
+/// Manages CoreBluetooth scanning, connection, and filtering of discovered
+/// peripherals against libdivecomputer's known device descriptors.
 class BLEManager: NSObject {
 
     weak var delegate: BLEManagerDelegate?
@@ -42,12 +42,15 @@ class BLEManager: NSObject {
     private var isScanning = false
 
     /// Cache of libdivecomputer descriptors that support BLE transport.
-    /// Loaded once and reused across scans.
     private var bleDescriptors: [(descriptor: OpaquePointer, vendor: String, product: String, family: UInt32, model: UInt32)] = []
 
-    /// Track already-reported peripherals (by UUID) to avoid duplicates
-    /// within a single scan session.
+    /// Track already-reported peripherals (by UUID) to avoid duplicates.
     private var discoveredPeripheralIDs: Set<UUID> = []
+
+    // Connection state
+    private var connectCompletion: ((Bool, String?) -> Void)?
+    private var disconnectCompletion: (() -> Void)?
+    private(set) var connectedPeripheral: CBPeripheral?
 
     override init() {
         super.init()
@@ -59,15 +62,12 @@ class BLEManager: NSObject {
         freeBLEDescriptors()
     }
 
-    // MARK: - Public API
+    // MARK: - Public API: Scanning
 
     func startScan() {
         discoveredPeripheralIDs.removeAll()
 
         if centralManager == nil {
-            // Creating CBCentralManager triggers a delegate callback with the
-            // current state. If the state is .poweredOn, we start scanning
-            // from the delegate method.
             centralManager = CBCentralManager(delegate: self, queue: nil)
         } else if centralManager?.state == .poweredOn {
             beginScanning()
@@ -83,11 +83,62 @@ class BLEManager: NSObject {
         }
     }
 
+    // MARK: - Public API: Connection
+
+    /// Connect to a discovered BLE peripheral.
+    /// Completion is called on the main queue with (success, errorMessage).
+    func connect(peripheral: CBPeripheral, completion: @escaping (Bool, String?) -> Void) {
+        // Stop scanning before connecting
+        stopScan()
+
+        guard let cm = centralManager, cm.state == .poweredOn else {
+            completion(false, "Bluetooth is not powered on")
+            return
+        }
+
+        self.connectCompletion = completion
+        self.connectedPeripheral = peripheral
+        cm.connect(peripheral, options: nil)
+        NSLog("[BLEManager] Connecting to \(peripheral.identifier)...")
+    }
+
+    /// Disconnect from the currently connected peripheral.
+    func disconnect(completion: (() -> Void)? = nil) {
+        guard let peripheral = connectedPeripheral, let cm = centralManager else {
+            completion?()
+            return
+        }
+        self.disconnectCompletion = completion
+        cm.cancelPeripheralConnection(peripheral)
+        NSLog("[BLEManager] Disconnecting from \(peripheral.identifier)...")
+    }
+
+    /// Find a libdivecomputer descriptor matching the given vendor and product.
+    /// Returns a freshly iterated descriptor that the caller must free.
+    func findDescriptor(vendor: String, product: String) -> OpaquePointer? {
+        var iterator: OpaquePointer?
+        guard dc_descriptor_iterator_new(&iterator, nil) == DC_STATUS_SUCCESS,
+              let iter = iterator else {
+            return nil
+        }
+
+        var descriptor: OpaquePointer?
+        while dc_iterator_next(iter, &descriptor) == DC_STATUS_SUCCESS {
+            guard let desc = descriptor else { continue }
+            let v = String(cString: dc_descriptor_get_vendor(desc))
+            let p = String(cString: dc_descriptor_get_product(desc))
+            if v == vendor && p == product {
+                dc_iterator_free(iter)
+                return desc  // Caller owns this — must free when done
+            }
+            dc_descriptor_free(desc)
+        }
+        dc_iterator_free(iter)
+        return nil
+    }
+
     // MARK: - Descriptor Loading
 
-    /// Load all libdivecomputer descriptors that support BLE transport.
-    /// We keep the OpaquePointers alive so we can call dc_descriptor_filter
-    /// on each discovered peripheral.
     private func loadBLEDescriptors() {
         var iterator: OpaquePointer?
         guard dc_descriptor_iterator_new(&iterator, nil) == DC_STATUS_SUCCESS,
@@ -99,7 +150,6 @@ class BLEManager: NSObject {
         while dc_iterator_next(iter, &descriptor) == DC_STATUS_SUCCESS {
             guard let desc = descriptor else { continue }
             let transports = dc_descriptor_get_transports(desc)
-            // Only keep descriptors that support BLE (bit 5 = 0x20)
             if (transports & UInt32(DC_TRANSPORT_BLE.rawValue)) != 0 {
                 let vendor = String(cString: dc_descriptor_get_vendor(desc))
                 let product = String(cString: dc_descriptor_get_product(desc))
@@ -117,7 +167,6 @@ class BLEManager: NSObject {
             }
         }
         dc_iterator_free(iter)
-
         NSLog("[BLEManager] Loaded \(bleDescriptors.count) BLE-capable descriptors")
     }
 
@@ -133,9 +182,6 @@ class BLEManager: NSObject {
     private func beginScanning() {
         guard !isScanning else { return }
         isScanning = true
-        // Scan for all BLE peripherals — we filter by name against
-        // libdivecomputer descriptors rather than by service UUID,
-        // because dive computers advertise with varying service UUIDs.
         centralManager?.scanForPeripherals(
             withServices: nil,
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
@@ -143,8 +189,6 @@ class BLEManager: NSObject {
         NSLog("[BLEManager] BLE scan started")
     }
 
-    /// Check a discovered peripheral's name against all cached BLE
-    /// descriptors using libdivecomputer's dc_descriptor_filter.
     private func matchDescriptor(name: String) -> (vendor: String, product: String, family: UInt32, model: UInt32)? {
         for entry in bleDescriptors {
             let matched = name.withCString { cName in
@@ -168,7 +212,6 @@ extension BLEManager: CBCentralManagerDelegate {
         switch central.state {
         case .poweredOn:
             NSLog("[BLEManager] Bluetooth powered on")
-            // If a scan was requested before BT was ready, start now
             beginScanning()
         case .poweredOff:
             NSLog("[BLEManager] Bluetooth powered off")
@@ -191,21 +234,17 @@ extension BLEManager: CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
-        // Skip peripherals we've already reported in this scan session
         guard !discoveredPeripheralIDs.contains(peripheral.identifier) else { return }
 
-        // Get the advertised name — prefer advertisementData over peripheral.name
-        // since peripheral.name can be cached from previous connections
         let name: String
         if let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String, !advName.isEmpty {
             name = advName
         } else if let peripheralName = peripheral.name, !peripheralName.isEmpty {
             name = peripheralName
         } else {
-            return // Skip unnamed peripherals — can't match against descriptors
+            return
         }
 
-        // Filter against libdivecomputer descriptors
         guard let match = matchDescriptor(name: name) else { return }
 
         discoveredPeripheralIDs.insert(peripheral.identifier)
@@ -222,5 +261,29 @@ extension BLEManager: CBCentralManagerDelegate {
 
         NSLog("[BLEManager] Discovered dive computer: \(match.vendor) \(match.product) (\(name)) RSSI: \(RSSI)")
         delegate?.bleManager(self, didDiscoverDevice: device)
+    }
+
+    // MARK: Connection callbacks
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        NSLog("[BLEManager] Connected to \(peripheral.identifier)")
+        connectCompletion?(true, nil)
+        connectCompletion = nil
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        let msg = error?.localizedDescription ?? "Unknown connection error"
+        NSLog("[BLEManager] Failed to connect: \(msg)")
+        connectedPeripheral = nil
+        connectCompletion?(false, msg)
+        connectCompletion = nil
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        NSLog("[BLEManager] Disconnected from \(peripheral.identifier)" +
+              (error != nil ? " error: \(error!)" : ""))
+        connectedPeripheral = nil
+        disconnectCompletion?()
+        disconnectCompletion = nil
     }
 }
