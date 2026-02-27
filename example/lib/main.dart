@@ -12,7 +12,7 @@ class DiveComputerExampleApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Dive Computer Plugin Test',
+      title: 'Dive Computer',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
@@ -235,7 +235,6 @@ class _HomePageState extends State<HomePage> {
 
               case 'dive':
                 final dive = DcDive.fromMap(event);
-                // Also pick up totalDives from individual dive events
                 final total = event['totalDives'] as int?;
                 setState(() {
                   _dives.add(dive);
@@ -271,194 +270,41 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Dive Computer Plugin Test')),
-      body: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Library status
-            Card(
-              child: ListTile(
-                leading: Icon(
-                  _libraryVersion.contains('libdivecomputer')
-                      ? Icons.check_circle
-                      : Icons.error,
-                  color: _libraryVersion.contains('libdivecomputer')
-                      ? Colors.green
-                      : Colors.red,
-                ),
-                title: const Text('Library Status'),
-                subtitle: Text(_libraryVersion),
-              ),
-            ),
-            const SizedBox(height: 8),
+      appBar: AppBar(title: const Text('Dive Computer')),
+      body: SafeArea(
+        child: _isConnected ? _buildConnectedView() : _buildScanView(),
+      ),
+    );
+  }
 
-            // Status message
-            if (_statusMessage.isNotEmpty)
-              Card(
-                color: _isConnected ? Colors.green.shade50 : null,
-                child: ListTile(
-                  leading: Icon(
-                    _isConnected
-                        ? Icons.bluetooth_connected
-                        : _isConnecting
-                        ? Icons.bluetooth_searching
-                        : Icons.info_outline,
-                    color: _isConnected ? Colors.green : null,
-                  ),
-                  title: Text(_isConnected ? 'Connected' : 'Status'),
-                  subtitle: Text(_statusMessage),
-                  trailing: _isConnecting
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : null,
-                ),
-              ),
-            const SizedBox(height: 16),
+  // MARK: - Scan View
 
-            // Connected device section
-            if (_isConnected && _connectedDevice != null) ...[
-              // Device info card with disconnect
-              Card(
-                color: Colors.green.shade50,
-                child: ListTile(
-                  leading: const Icon(
-                    Icons.bluetooth_connected,
-                    color: Colors.green,
-                    size: 32,
-                  ),
-                  title: Text(
-                    '${_connectedDevice!.vendor} ${_connectedDevice!.product}',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  subtitle: Text(
-                    _connectedDevice!.address +
-                        (_devInfoSerial != null
-                            ? '\nS/N: $_devInfoSerial  FW: $_devInfoFirmware'
-                            : ''),
-                  ),
-                  isThreeLine: _devInfoSerial != null,
-                  trailing: FilledButton.tonal(
-                    onPressed: _isDownloading ? null : _disconnect,
-                    child: const Text('Disconnect'),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 8),
-
-              // Download button + progress
-              Row(
-                children: [
-                  FilledButton.icon(
-                    onPressed: _isDownloading ? null : _startDownload,
-                    icon: Icon(
-                      _isDownloading ? Icons.hourglass_top : Icons.download,
-                    ),
-                    label: Text(
-                      _isDownloading
-                          ? 'Downloading...'
-                          : _dives.isEmpty
-                          ? 'Download Dives'
-                          : 'Re-download',
-                    ),
-                  ),
-                  if (_isDownloading) ...[
-                    const SizedBox(width: 8),
-                    OutlinedButton.icon(
-                      onPressed: _cancelDownload,
-                      icon: const Icon(Icons.cancel),
-                      label: const Text('Cancel'),
-                    ),
-                  ],
-                  const SizedBox(width: 16),
-                  if (_isDownloading || _downloadProgress > 0)
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          LinearProgressIndicator(
-                            value: _isDownloading ? _downloadProgress : 1.0,
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            _isDownloading
-                                ? '${(_downloadProgress * 100).toInt()}%  •  ${_dives.length}${_totalDiveCount != null ? ' of ~$_totalDiveCount' : ''} dives'
-                                : '${_dives.length} dives downloaded',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ],
-                      ),
-                    ),
-                ],
-              ),
-              const SizedBox(height: 4),
-
-              // Download options
-              Row(
-                children: [
-                  SizedBox(
-                    height: 32,
-                    child: FilterChip(
-                      label: const Text('Force full download'),
-                      selected: _forceDownload,
-                      onSelected: _isDownloading
-                          ? null
-                          : (value) => setState(() => _forceDownload = value),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  TextButton.icon(
-                    onPressed: _isDownloading ? null : _resetFingerprint,
-                    icon: const Icon(Icons.delete_outline, size: 18),
-                    label: const Text('Reset Fingerprint'),
-                  ),
-                ],
-              ),
+  Widget _buildScanView() {
+    return Column(
+      children: [
+        // Fixed header area
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildLibraryStatusCard(),
+              if (_statusMessage.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                _buildStatusCard(),
+              ],
               const SizedBox(height: 16),
-
-              // Dive list header
-              if (_dives.isNotEmpty)
-                Text(
-                  'Dives (${_dives.length})',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-              const SizedBox(height: 4),
-            ],
-
-            // BLE Scan section (when not connected)
-            if (!_isConnected) ...[
-              Row(
-                children: [
-                  Text(
-                    'BLE Scan',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  const Spacer(),
-                  if (_isScanning)
-                    const Padding(
-                      padding: EdgeInsets.only(right: 8.0),
-                      child: SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    ),
-                  FilledButton.icon(
-                    onPressed: _isConnecting
-                        ? null
-                        : (_isScanning ? _stopScan : _startScan),
-                    icon: Icon(
-                      _isScanning ? Icons.stop : Icons.bluetooth_searching,
-                    ),
-                    label: Text(_isScanning ? 'Stop' : 'Scan'),
-                  ),
-                ],
-              ),
+              _buildScanHeader(),
               const SizedBox(height: 8),
+            ],
+          ),
+        ),
+
+        // Scrollable device list
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            children: [
               if (_discoveredDevices.isEmpty && _isScanning)
                 const Card(
                   child: ListTile(
@@ -468,7 +314,8 @@ class _HomePageState extends State<HomePage> {
                     ),
                     title: Text('Scanning for dive computers...'),
                     subtitle: Text(
-                      'Make sure your dive computer is in Bluetooth pairing mode',
+                      'Make sure your dive computer is in '
+                      'Bluetooth pairing mode',
                     ),
                   ),
                 ),
@@ -482,51 +329,89 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ),
                 ),
+              ..._discoveredDevices.map(_buildDeviceCard),
             ],
+          ),
+        ),
+      ],
+    );
+  }
 
-            // Scrollable content area
-            Expanded(
-              child: ListView(
-                children: [
-                  // Discovered BLE devices (when scanning)
-                  if (!_isConnected)
-                    ..._discoveredDevices.map(
-                      (device) => Card(
-                        color: Theme.of(context).colorScheme.primaryContainer,
-                        child: ListTile(
-                          leading: const Icon(
-                            Icons.bluetooth_connected,
-                            color: Colors.blue,
-                          ),
-                          title: Text(device.name),
-                          subtitle: Text(
-                            '${device.vendor} ${device.product}\n'
-                            'RSSI: ${device.rssi} dBm  •  ${device.address}',
-                          ),
-                          isThreeLine: true,
-                          trailing: FilledButton(
-                            onPressed: _isConnecting
-                                ? null
-                                : () => _connectToDevice(device),
-                            child: _isConnecting
-                                ? const SizedBox(
-                                    width: 16,
-                                    height: 16,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Colors.white,
-                                    ),
-                                  )
-                                : const Text('Connect'),
-                          ),
-                        ),
+  Widget _buildScanHeader() {
+    return Row(
+      children: [
+        Text('BLE Scan', style: Theme.of(context).textTheme.titleMedium),
+        const Spacer(),
+        if (_isScanning)
+          const Padding(
+            padding: EdgeInsets.only(right: 8.0),
+            child: SizedBox(
+              width: 16,
+              height: 16,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
+        FilledButton.icon(
+          onPressed: _isConnecting
+              ? null
+              : (_isScanning ? _stopScan : _startScan),
+          icon: Icon(_isScanning ? Icons.stop : Icons.bluetooth_searching),
+          label: Text(_isScanning ? 'Stop' : 'Scan'),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDeviceCard(DcDeviceInfo device) {
+    return Card(
+      color: Theme.of(context).colorScheme.primaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.bluetooth_connected, color: Colors.blue),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        device.name,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
                       ),
-                    ),
-
-                  // Dive list (when connected and downloaded)
-                  if (_isConnected)
-                    ..._dives.map((dive) => _buildDiveCard(dive)),
-                ],
+                      Text(
+                        '${device.vendor} ${device.product}',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                      Text(
+                        'RSSI: ${device.rssi} dBm',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton(
+                onPressed: _isConnecting
+                    ? null
+                    : () => _connectToDevice(device),
+                child: _isConnecting
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Colors.white,
+                        ),
+                      )
+                    : const Text('Connect'),
               ),
             ),
           ],
@@ -535,9 +420,226 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  // MARK: - Connected View
+
+  Widget _buildConnectedView() {
+    return Column(
+      children: [
+        // Fixed connection info and controls
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildConnectedDeviceCard(),
+              const SizedBox(height: 8),
+              if (_statusMessage.isNotEmpty) ...[
+                _buildStatusCard(),
+                const SizedBox(height: 8),
+              ],
+              _buildDownloadControls(),
+              if (_isDownloading || _downloadProgress > 0) ...[
+                const SizedBox(height: 8),
+                _buildProgressBar(),
+              ],
+              const SizedBox(height: 8),
+              _buildDownloadOptions(),
+              if (_dives.isNotEmpty) ...[
+                const SizedBox(height: 12),
+                Text(
+                  'Dives (${_dives.length})',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ],
+              const SizedBox(height: 4),
+            ],
+          ),
+        ),
+
+        // Scrollable dive list
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            itemCount: _dives.length,
+            itemBuilder: (context, index) => _buildDiveCard(_dives[index]),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildConnectedDeviceCard() {
+    return Card(
+      color: Colors.green.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(
+                  Icons.bluetooth_connected,
+                  color: Colors.green,
+                  size: 28,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${_connectedDevice!.vendor} '
+                        '${_connectedDevice!.product}',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      Text(
+                        _connectedDevice!.address,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                      if (_devInfoSerial != null)
+                        Text(
+                          'S/N: $_devInfoSerial  FW: $_devInfoFirmware',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton.tonal(
+                onPressed: _isDownloading ? null : _disconnect,
+                child: const Text('Disconnect'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDownloadControls() {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        FilledButton.icon(
+          onPressed: _isDownloading ? null : _startDownload,
+          icon: Icon(_isDownloading ? Icons.hourglass_top : Icons.download),
+          label: Text(
+            _isDownloading
+                ? 'Downloading...'
+                : _dives.isEmpty
+                ? 'Download Dives'
+                : 'Re-download',
+          ),
+        ),
+        if (_isDownloading)
+          OutlinedButton.icon(
+            onPressed: _cancelDownload,
+            icon: const Icon(Icons.cancel),
+            label: const Text('Cancel'),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildProgressBar() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        LinearProgressIndicator(
+          value: _isDownloading ? _downloadProgress : 1.0,
+        ),
+        const SizedBox(height: 4),
+        Text(
+          _isDownloading
+              ? '${(_downloadProgress * 100).toInt()}%  •  '
+                    '${_dives.length}'
+                    '${_totalDiveCount != null ? ' of ~$_totalDiveCount' : ''} '
+                    'dives'
+              : '${_dives.length} dives downloaded',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDownloadOptions() {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      children: [
+        SizedBox(
+          height: 32,
+          child: FilterChip(
+            label: const Text('Force full download'),
+            selected: _forceDownload,
+            onSelected: _isDownloading
+                ? null
+                : (value) => setState(() => _forceDownload = value),
+          ),
+        ),
+        TextButton.icon(
+          onPressed: _isDownloading ? null : _resetFingerprint,
+          icon: const Icon(Icons.delete_outline, size: 18),
+          label: const Text('Reset Fingerprint'),
+        ),
+      ],
+    );
+  }
+
+  // MARK: - Shared Cards
+
+  Widget _buildLibraryStatusCard() {
+    final isOk = _libraryVersion.contains('libdivecomputer');
+    return Card(
+      child: ListTile(
+        leading: Icon(
+          isOk ? Icons.check_circle : Icons.error,
+          color: isOk ? Colors.green : Colors.red,
+        ),
+        title: const Text('Library Status'),
+        subtitle: Text(_libraryVersion),
+      ),
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Card(
+      color: _isConnected ? Colors.green.shade50 : null,
+      child: ListTile(
+        leading: Icon(
+          _isConnected
+              ? Icons.bluetooth_connected
+              : _isConnecting
+              ? Icons.bluetooth_searching
+              : Icons.info_outline,
+          color: _isConnected ? Colors.green : null,
+        ),
+        title: Text(_isConnected ? 'Connected' : 'Status'),
+        subtitle: Text(_statusMessage),
+        trailing: _isConnecting
+            ? const SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : null,
+      ),
+    );
+  }
+
+  // MARK: - Dive Card
+
   Widget _buildDiveCard(DcDive dive) {
     final dateStr = dive.dateTime != null
-        ? '${dive.dateTime!.year}-${dive.dateTime!.month.toString().padLeft(2, '0')}-'
+        ? '${dive.dateTime!.year}-'
+              '${dive.dateTime!.month.toString().padLeft(2, '0')}-'
               '${dive.dateTime!.day.toString().padLeft(2, '0')}  '
               '${dive.dateTime!.hour.toString().padLeft(2, '0')}:'
               '${dive.dateTime!.minute.toString().padLeft(2, '0')}'
