@@ -1,4 +1,4 @@
-module LibDiveComputer [system] {
+module LibDiveComputer {
     header "libdivecomputer/common.h"
     header "libdivecomputer/context.h"
     header "libdivecomputer/descriptor.h"
