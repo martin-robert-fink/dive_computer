@@ -1,5 +1,11 @@
 import 'package:flutter/services.dart';
 
+/// Plugin interface for communicating with dive computers via libdivecomputer.
+///
+/// Scanning uses an EventChannel (lightweight discovery events).
+/// Downloads use a polling model: call [startDownload], poll [getDownloadProgress]
+/// on a timer, then call [getDownloadedDives] when complete to retrieve full data.
+/// This matches Subsurface's architecture and avoids main queue congestion on iOS.
 class DiveComputerPlugin {
   DiveComputerPlugin._();
 
@@ -11,10 +17,6 @@ class DiveComputerPlugin {
 
   static const EventChannel _scanChannel = EventChannel(
     'com.example.dive_computer/scan',
-  );
-
-  static const EventChannel _downloadChannel = EventChannel(
-    'com.example.dive_computer/download',
   );
 
   Future<String> getLibraryVersion() async {
@@ -51,10 +53,40 @@ class DiveComputerPlugin {
     return result ?? false;
   }
 
-  Stream<Map<String, dynamic>> downloadDives({bool forceDownload = false}) {
-    return _downloadChannel
-        .receiveBroadcastStream({'forceDownload': forceDownload})
-        .map((event) => Map<String, dynamic>.from(event as Map));
+  /// Start a dive download. Returns immediately.
+  /// Poll [getDownloadProgress] to track progress.
+  /// Call [getDownloadedDives] after completion for full dive data.
+  Future<void> startDownload({bool forceDownload = false}) async {
+    await _channel.invokeMethod('startDownload', {
+      'forceDownload': forceDownload,
+    });
+  }
+
+  /// Cancel an active download.
+  Future<void> cancelDownload() async {
+    await _channel.invokeMethod('cancelDownload');
+  }
+
+  /// Poll current download progress. Returns a map with:
+  /// - `isActive` (bool): whether download is still running
+  /// - `progressFraction` (double): 0.0 to 1.0
+  /// - `diveCount` (int): dives downloaded so far
+  /// - `estimatedTotalDives` (int?): estimated total, if known
+  /// - `serial` (int?): device serial number
+  /// - `firmware` (int?): device firmware version
+  /// - `status` (String?): null while active; "success"/"done"/"error(N)" when finished
+  Future<Map<String, dynamic>> getDownloadProgress() async {
+    final result = await _channel.invokeMethod<Map>('getDownloadProgress');
+    if (result == null) return {'isActive': false, 'diveCount': 0};
+    return Map<String, dynamic>.from(result);
+  }
+
+  /// Retrieve all downloaded dive data (with full samples).
+  /// Call after download completes for best results.
+  Future<List<Map<String, dynamic>>> getDownloadedDives() async {
+    final result = await _channel.invokeMethod<List>('getDownloadedDives');
+    if (result == null) return [];
+    return result.cast<Map>().map((m) => Map<String, dynamic>.from(m)).toList();
   }
 
   Future<void> resetFingerprint() async {

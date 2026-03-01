@@ -1,24 +1,63 @@
 import Foundation
 import LibDiveComputer
 
-/// Callback type for streaming download events to Flutter.
-typealias DownloadEventCallback = ([String: Any]) -> Void
+/// Snapshot of download progress, safe to read from any thread.
+struct DownloadProgress {
+    let isActive: Bool
+    let progressFraction: Double
+    let diveCount: Int
+    let estimatedTotalDives: Int?
+    let serial: UInt32?
+    let firmware: UInt32?
+    /// nil while active; "success", "done", or "error(N)" when finished
+    let status: String?
+
+    func toMap() -> [String: Any?] {
+        return [
+            "isActive": isActive,
+            "progressFraction": progressFraction,
+            "diveCount": diveCount,
+            "estimatedTotalDives": estimatedTotalDives,
+            "serial": serial != nil ? Int(serial!) : nil,
+            "firmware": firmware != nil ? Int(firmware!) : nil,
+            "status": status,
+        ]
+    }
+}
 
 /// Manages the dive download process using libdivecomputer's
 /// dc_device_foreach and dc_parser APIs. Runs entirely on a
 /// background DispatchQueue to avoid blocking the main thread.
+///
+/// Design (matching Subsurface):
+/// - All BLE and parsing work happens on a background thread
+/// - Progress is written to shared properties (no main queue dispatches)
+/// - The UI polls progress via a MethodChannel timer
+/// - Full dive data is stored in memory and retrieved after download completes
+/// - This eliminates all main queue work during BLE communication
 class DiveDownloader {
 
     private let device: OpaquePointer     // dc_device_t*
-    private let onEvent: DownloadEventCallback
     private let forceDownload: Bool
+    private let completion: (DownloadProgress) -> Void
 
-    fileprivate var deviceSerial: UInt32? = nil
-    fileprivate var diveCount = 0
+    // MARK: - Shared State (written from background, read from main)
+
+    private let stateLock = NSLock()
+
+    private var _progressFraction: Double = 0
+    private var _diveCount: Int = 0
+    private var _estimatedTotalDives: Int? = nil
+    private var _serial: UInt32? = nil
+    private var _firmware: UInt32? = nil
+    private var _isActive: Bool = true
+    private var _status: String? = nil
+
+    /// Full parsed dive data, accumulated during download.
+    /// Only accessed after download completes, so no lock needed for reads.
+    private var _downloadedDives: [[String: Any]] = []
+
     fileprivate var isCancelled = false
-
-    /// Estimated total number of dives, derived from progress when first dive arrives.
-    fileprivate var estimatedTotalDives: Int? = nil
 
     /// Track progress state for dive count estimation
     fileprivate var lastProgressCurrent: Int = 0
@@ -27,10 +66,11 @@ class DiveDownloader {
     /// Whether we've received devinfo (and set fingerprint)
     fileprivate var devInfoReceived = false
 
-    init(device: OpaquePointer, forceDownload: Bool = false, onEvent: @escaping DownloadEventCallback) {
+    init(device: OpaquePointer, forceDownload: Bool = false,
+         completion: @escaping (DownloadProgress) -> Void) {
         self.device = device
         self.forceDownload = forceDownload
-        self.onEvent = onEvent
+        self.completion = completion
     }
 
     /// Start the download on a background thread.
@@ -42,6 +82,74 @@ class DiveDownloader {
 
     func cancel() {
         isCancelled = true
+    }
+
+    // MARK: - Progress Snapshot (thread-safe read)
+
+    /// Returns a snapshot of the current download state.
+    /// Safe to call from any thread (main thread for MethodChannel).
+    func getProgress() -> DownloadProgress {
+        stateLock.lock()
+        let progress = DownloadProgress(
+            isActive: _isActive,
+            progressFraction: _progressFraction,
+            diveCount: _diveCount,
+            estimatedTotalDives: _estimatedTotalDives,
+            serial: _serial,
+            firmware: _firmware,
+            status: _status
+        )
+        stateLock.unlock()
+        return progress
+    }
+
+    /// Returns all downloaded dive data. Call only after download completes.
+    func getDownloadedDives() -> [[String: Any]] {
+        return _downloadedDives
+    }
+
+    // MARK: - State Updates (called from background thread)
+
+    fileprivate func updateProgress(fraction: Double) {
+        stateLock.lock()
+        _progressFraction = fraction
+        stateLock.unlock()
+    }
+
+    fileprivate func updateDiveCount(_ count: Int) {
+        stateLock.lock()
+        _diveCount = count
+        stateLock.unlock()
+    }
+
+    fileprivate func updateEstimatedTotal(_ total: Int) {
+        stateLock.lock()
+        _estimatedTotalDives = total
+        stateLock.unlock()
+    }
+
+    fileprivate func updateDevInfo(serial: UInt32, firmware: UInt32) {
+        stateLock.lock()
+        _serial = serial
+        _firmware = firmware
+        stateLock.unlock()
+    }
+
+    private func finish(status: String) {
+        stateLock.lock()
+        _isActive = false
+        _status = status
+        _progressFraction = 1.0
+        stateLock.unlock()
+
+        let finalProgress = getProgress()
+        NSLog("[DiveDownloader] Download finished: \(status), \(_diveCount) dives")
+
+        // Single callback on main thread when complete
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.completion(finalProgress)
+        }
     }
 
     // MARK: - Download
@@ -70,25 +178,11 @@ class DiveDownloader {
         default:                statusName = "error(\(status.rawValue))"
         }
 
-        NSLog("[DiveDownloader] Download finished: \(statusName), \(diveCount) dives")
-
-        // Save fingerprint on successful download
-        if status == DC_STATUS_SUCCESS || status == DC_STATUS_DONE {
-            // Fingerprint is saved during dive processing (from first dive)
-        }
-
-        sendEvent([
-            "type": "complete",
-            "totalDives": diveCount,
-            "status": statusName,
-        ])
+        finish(status: statusName)
     }
 
     // MARK: - Fingerprint Persistence
 
-    /// Called from the DEVINFO event handler to load and set the saved
-    /// fingerprint. This enables incremental downloads — libdivecomputer
-    /// will stop at the previously-downloaded dive.
     fileprivate func loadAndSetFingerprint(serial: UInt32) {
         if forceDownload {
             NSLog("[DiveDownloader] Force download — skipping saved fingerprint")
@@ -116,44 +210,36 @@ class DiveDownloader {
         }
     }
 
-    /// Save the fingerprint from the first (newest) dive for next time.
     fileprivate func saveFingerprint(_ data: Data, serial: UInt32) {
         FingerprintStore.save(serial: serial, fingerprint: data)
         NSLog("[DiveDownloader] Saved fingerprint for serial \(serial): \(data.map { String(format: "%02x", $0) }.joined())")
-    }
-
-    // MARK: - Event Sending (thread-safe to main queue)
-
-    fileprivate func sendEvent(_ event: [String: Any]) {
-        DispatchQueue.main.async { [weak self] in
-            self?.onEvent(event)
-        }
     }
 
     // MARK: - Dive Parsing
 
     fileprivate func processDive(data: UnsafePointer<UInt8>, size: UInt32,
                                   fingerprint: UnsafePointer<UInt8>?, fpSize: UInt32) -> Bool {
-        diveCount += 1
 
-        // Estimate total dives when the first dive arrives.
-        // At this point, the manifest phase is complete and lastProgressMaximum
-        // is stable. For Shearwater: max = NSTEPS(10000) * (manifest_pages + dive_count).
-        // Using max/10000 gives a close approximation (off by a few manifest pages).
-        if diveCount == 1 && lastProgressMaximum > 0 {
+        stateLock.lock()
+        _diveCount += 1
+        let diveNumber = _diveCount
+        stateLock.unlock()
+
+        // Estimate total dives when the first dive arrives
+        if diveNumber == 1 && lastProgressMaximum > 0 {
             let totalSteps = lastProgressMaximum / 10000
             if totalSteps > 0 {
-                estimatedTotalDives = totalSteps
+                updateEstimatedTotal(totalSteps)
                 NSLog("[DiveDownloader] Estimated total dives: ~\(totalSteps) (from progress max=\(lastProgressMaximum))")
-                sendEvent([
-                    "type": "totalDives",
-                    "totalDives": totalSteps,
-                ])
             }
         }
 
-        // Save fingerprint from the first (newest) dive for incremental downloads
-        if diveCount == 1, let fp = fingerprint, fpSize > 0, let serial = deviceSerial {
+        // Save fingerprint from the first (newest) dive
+        stateLock.lock()
+        let serial = _serial
+        stateLock.unlock()
+
+        if diveNumber == 1, let fp = fingerprint, fpSize > 0, let serial = serial {
             let fpData = Data(bytes: fp, count: Int(fpSize))
             saveFingerprint(fpData, serial: serial)
         }
@@ -162,24 +248,25 @@ class DiveDownloader {
         let status = dc_parser_new(&parser, device, data, Int(size))
 
         guard status == DC_STATUS_SUCCESS, let parser = parser else {
-            NSLog("[DiveDownloader] Failed to create parser for dive \(diveCount): \(status.rawValue)")
-            sendEvent([
-                "type": "dive",
-                "number": diveCount,
+            NSLog("[DiveDownloader] Failed to create parser for dive \(diveNumber): \(status.rawValue)")
+            _downloadedDives.append([
+                "number": diveNumber,
                 "error": "Parser creation failed (\(status.rawValue))",
             ])
-            return true // Continue to next dive
+            return true
         }
 
         defer { dc_parser_destroy(parser) }
 
         var diveEvent: [String: Any] = [
-            "type": "dive",
-            "number": diveCount,
+            "number": diveNumber,
         ]
 
-        // Include estimated total if known
-        if let total = estimatedTotalDives {
+        stateLock.lock()
+        let total = _estimatedTotalDives
+        stateLock.unlock()
+
+        if let total = total {
             diveEvent["totalDives"] = total
         }
 
@@ -298,36 +385,35 @@ class DiveDownloader {
             }
         }
 
-        // Depth profile samples
+        // Depth profile samples — parsed and stored in memory for later retrieval
         let sampleCollector = SampleCollector()
         let samplePtr = Unmanaged.passUnretained(sampleCollector).toOpaque()
         dc_parser_samples_foreach(parser, sampleCallback, samplePtr)
-        sampleCollector.flush() // Flush the last sample (no trailing TIME event)
+        sampleCollector.flush()
 
         if !sampleCollector.samples.isEmpty {
             diveEvent["samples"] = sampleCollector.samples
+            diveEvent["sampleCount"] = sampleCollector.samples.count
         }
 
-        // Fingerprint (for incremental downloads later)
+        // Fingerprint
         if let fp = fingerprint, fpSize > 0 {
             let fpData = Data(bytes: fp, count: Int(fpSize))
             diveEvent["fingerprint"] = fpData.map { String(format: "%02x", $0) }.joined()
         }
 
-        NSLog("[DiveDownloader] Dive #\(diveCount)\(estimatedTotalDives != nil ? "/\(estimatedTotalDives!)" : ""): " +
+        NSLog("[DiveDownloader] Dive #\(diveNumber)\(total != nil ? "/\(total!)" : ""): " +
               "depth=\(diveEvent["maxDepth"] ?? "?")m, " +
               "time=\(diveEvent["diveTime"] ?? "?")s, samples=\(sampleCollector.samples.count)")
 
-        sendEvent(diveEvent)
-        return true // Continue to next dive
+        // Store in memory — NO dispatch to main queue
+        _downloadedDives.append(diveEvent)
+        return true
     }
 }
 
 // MARK: - Fingerprint Store
 
-/// Persists dive fingerprints to disk, keyed by device serial number.
-/// Used for incremental downloads — only new dives since the last
-/// download are transferred.
 struct FingerprintStore {
 
     private static var directory: URL {
@@ -363,7 +449,6 @@ struct FingerprintStore {
 
 // MARK: - Sample Collector
 
-/// Collects depth profile samples from dc_parser_samples_foreach.
 fileprivate class SampleCollector {
     var samples: [[String: Any]] = []
     var currentSample: [String: Any] = [:]
@@ -378,7 +463,6 @@ fileprivate class SampleCollector {
 
 // MARK: - C Callbacks
 
-/// Device event callback (progress, devinfo).
 private let deviceEventCallback: @convention(c)
     (OpaquePointer?, dc_event_type_t, UnsafeRawPointer?, UnsafeMutableRawPointer?) -> Void =
 { _, event, data, userdata in
@@ -391,51 +475,35 @@ private let deviceEventCallback: @convention(c)
         let current = Int(progress.current)
         let maximum = Int(progress.maximum)
 
-        // Track latest progress values for dive count estimation
         downloader.lastProgressCurrent = current
         downloader.lastProgressMaximum = maximum
 
-        downloader.sendEvent([
-            "type": "progress",
-            "current": current,
-            "maximum": maximum,
-        ])
+        // Just update a shared variable — no main queue dispatch
+        if maximum > 0 {
+            downloader.updateProgress(fraction: Double(current) / Double(maximum))
+        }
 
     case DC_EVENT_DEVINFO:
         let devinfo = data.assumingMemoryBound(to: dc_event_devinfo_t.self).pointee
         let serial = devinfo.serial
-        NSLog("[DiveDownloader] DevInfo: model=\(devinfo.model) fw=\(devinfo.firmware) serial=\(serial)")
+        let firmware = devinfo.firmware
+        NSLog("[DiveDownloader] DevInfo: model=\(devinfo.model) fw=\(firmware) serial=\(serial)")
 
         downloader.devInfoReceived = true
-
-        // Store serial for fingerprint saving during dive processing
-        downloader.deviceSerial = serial
-
-        // Load and set saved fingerprint for incremental download
-        // This MUST happen during DEVINFO, before manifest processing begins
-        // (matching Subsurface's approach)
+        downloader.updateDevInfo(serial: serial, firmware: firmware)
         downloader.loadAndSetFingerprint(serial: serial)
-
-        downloader.sendEvent([
-            "type": "devinfo",
-            "model": Int(devinfo.model),
-            "firmware": Int(devinfo.firmware),
-            "serial": Int(serial),
-        ])
 
     default:
         break
     }
 }
 
-/// Cancel callback — checks if download was cancelled.
 private let deviceCancelCallback: @convention(c) (UnsafeMutableRawPointer?) -> Int32 = { userdata in
     guard let userdata = userdata else { return 0 }
     let downloader = Unmanaged<DiveDownloader>.fromOpaque(userdata).takeUnretainedValue()
     return downloader.isCancelled ? 1 : 0
 }
 
-/// Dive callback — called for each dive found on the device.
 private let diveCallback: @convention(c)
     (UnsafePointer<UInt8>?, UInt32, UnsafePointer<UInt8>?, UInt32, UnsafeMutableRawPointer?) -> Int32 =
 { data, size, fingerprint, fpSize, userdata in
@@ -447,7 +515,6 @@ private let diveCallback: @convention(c)
     return shouldContinue ? 1 : 0
 }
 
-/// Sample callback — called for each sample point in a dive profile.
 private let sampleCallback: @convention(c)
     (dc_sample_type_t, UnsafePointer<dc_sample_value_t>?, UnsafeMutableRawPointer?) -> Void =
 { type, value, userdata in
@@ -456,9 +523,8 @@ private let sampleCallback: @convention(c)
 
     switch type {
     case DC_SAMPLE_TIME:
-        // New sample point — flush previous
         collector.flush()
-        collector.currentSample["time"] = Int(value.pointee.time) // milliseconds
+        collector.currentSample["time"] = Int(value.pointee.time)
 
     case DC_SAMPLE_DEPTH:
         collector.currentSample["depth"] = value.pointee.depth

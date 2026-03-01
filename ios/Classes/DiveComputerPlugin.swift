@@ -7,25 +7,20 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
 
     private let methodChannel: FlutterMethodChannel
     private var scanEventSink: FlutterEventSink?
-    private var downloadEventSink: FlutterEventSink?
     lazy var bleManager: BLEManager = {
         let manager = BLEManager()
         manager.delegate = self
         return manager
     }()
 
-    /// Keep strong references to discovered peripherals so CoreBluetooth
-    /// doesn't deallocate them before we connect.
     private var discoveredPeripherals: [String: CBPeripheral] = [:]
-
-    /// Track the advertised name for each peripheral (for dc_descriptor_filter matching)
     private var discoveredDeviceNames: [String: String] = [:]
 
     // Active connection state
     private var bleTransport: BLETransport?
-    private var dcContext: OpaquePointer?       // dc_context_t*
-    private var dcDevice: OpaquePointer?        // dc_device_t*
-    private var dcDescriptor: OpaquePointer?    // dc_descriptor_t* (for connected device)
+    private var dcContext: OpaquePointer?
+    private var dcDevice: OpaquePointer?
+    private var dcDescriptor: OpaquePointer?
 
     // Active download
     private var diveDownloader: DiveDownloader?
@@ -46,15 +41,9 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             binaryMessenger: registrar.messenger()
         )
 
-        let downloadChannel = FlutterEventChannel(
-            name: "com.example.dive_computer/download",
-            binaryMessenger: registrar.messenger()
-        )
-
         let instance = DiveComputerPlugin(channel: methodChannel)
         registrar.addMethodCallDelegate(instance, channel: methodChannel)
         scanChannel.setStreamHandler(ScanStreamHandler(plugin: instance))
-        downloadChannel.setStreamHandler(DownloadStreamHandler(plugin: instance))
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -72,6 +61,14 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
             handleDisconnect(result: result)
         case "resetFingerprint":
             handleResetFingerprint(result: result)
+        case "startDownload":
+            handleStartDownload(call: call, result: result)
+        case "cancelDownload":
+            handleCancelDownload(result: result)
+        case "getDownloadProgress":
+            handleGetDownloadProgress(result: result)
+        case "getDownloadedDives":
+            handleGetDownloadedDives(result: result)
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -220,42 +217,57 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
         return true
     }
 
-    // MARK: - Download
+    // MARK: - Download (polling model)
 
-    func startDownload(forceDownload: Bool = false) {
+    private func handleStartDownload(call: FlutterMethodCall, result: @escaping FlutterResult) {
         guard let device = dcDevice else {
-            NSLog("[Plugin] Cannot download — no device connected")
-            downloadEventSink?(FlutterError(
-                code: "NO_DEVICE",
-                message: "No dive computer connected",
-                details: nil
-            ))
+            result(FlutterError(code: "NO_DEVICE", message: "No dive computer connected", details: nil))
             return
+        }
+
+        var forceDownload = false
+        if let args = call.arguments as? [String: Any],
+           let force = args["forceDownload"] as? Bool {
+            forceDownload = force
         }
 
         NSLog("[Plugin] Starting dive download (forceDownload=\(forceDownload))")
 
-        // Purge any stale data that arrived between connect and download
         bleTransport?.prepareForNewOperation()
 
-        let downloader = DiveDownloader(device: device, forceDownload: forceDownload) { [weak self] event in
-            guard let self = self else { return }
-            self.downloadEventSink?(event)
-
-            // End the stream when download completes
-            if let type = event["type"] as? String, type == "complete" {
-                self.downloadEventSink?(FlutterEndOfEventStream)
-                self.diveDownloader = nil
-            }
+        let downloader = DiveDownloader(device: device, forceDownload: forceDownload) { [weak self] finalProgress in
+            NSLog("[Plugin] Download complete: \(finalProgress.status ?? "unknown"), \(finalProgress.diveCount) dives")
+            _ = self?.diveDownloader
         }
 
         self.diveDownloader = downloader
         downloader.start()
+        result(nil)
     }
 
-    func cancelDownload() {
+    private func handleCancelDownload(result: @escaping FlutterResult) {
         diveDownloader?.cancel()
-        diveDownloader = nil
+        result(nil)
+    }
+
+    private func handleGetDownloadProgress(result: @escaping FlutterResult) {
+        guard let downloader = diveDownloader else {
+            result([
+                "isActive": false,
+                "progressFraction": 0.0,
+                "diveCount": 0,
+            ] as [String: Any])
+            return
+        }
+        result(downloader.getProgress().toMap())
+    }
+
+    private func handleGetDownloadedDives(result: @escaping FlutterResult) {
+        guard let downloader = diveDownloader else {
+            result([])
+            return
+        }
+        result(downloader.getDownloadedDives())
     }
 
     // MARK: - Fingerprint Management
@@ -269,7 +281,8 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
     // MARK: - Disconnection
 
     private func handleDisconnect(result: @escaping FlutterResult) {
-        cancelDownload()
+        diveDownloader?.cancel()
+        diveDownloader = nil
         cleanupConnection()
         bleManager.disconnect {
             result(nil)
@@ -309,10 +322,6 @@ public class DiveComputerPlugin: NSObject, FlutterPlugin {
 
     func setScanEventSink(_ sink: FlutterEventSink?) {
         self.scanEventSink = sink
-    }
-
-    func setDownloadEventSink(_ sink: FlutterEventSink?) {
-        self.downloadEventSink = sink
     }
 }
 
@@ -356,28 +365,6 @@ class ScanStreamHandler: NSObject, FlutterStreamHandler {
     func onCancel(withArguments arguments: Any?) -> FlutterError? {
         plugin?.bleManager.stopScan()
         plugin?.setScanEventSink(nil)
-        return nil
-    }
-}
-
-class DownloadStreamHandler: NSObject, FlutterStreamHandler {
-    weak var plugin: DiveComputerPlugin?
-    init(plugin: DiveComputerPlugin) { self.plugin = plugin }
-
-    func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-        var forceDownload = false
-        if let args = arguments as? [String: Any],
-           let force = args["forceDownload"] as? Bool {
-            forceDownload = force
-        }
-        plugin?.setDownloadEventSink(events)
-        plugin?.startDownload(forceDownload: forceDownload)
-        return nil
-    }
-
-    func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        plugin?.cancelDownload()
-        plugin?.setDownloadEventSink(nil)
         return nil
     }
 }

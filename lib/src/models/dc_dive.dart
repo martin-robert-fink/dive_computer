@@ -12,6 +12,7 @@ class DcDive {
   final List<DcGasMix>? gasMixes;
   final List<DcTank>? tanks;
   final List<Map<String, dynamic>>? samples;
+  final int? sampleCount;
   final String? fingerprint;
   final String? error;
 
@@ -29,6 +30,7 @@ class DcDive {
     this.gasMixes,
     this.tanks,
     this.samples,
+    this.sampleCount,
     this.fingerprint,
     this.error,
   });
@@ -58,6 +60,8 @@ class DcDive {
       samples: (map['samples'] as List?)
           ?.map((m) => Map<String, dynamic>.from(m as Map))
           .toList(),
+      sampleCount:
+          map['sampleCount'] as int? ?? (map['samples'] as List?)?.length,
       fingerprint: map['fingerprint'] as String?,
       error: map['error'] as String?,
     );

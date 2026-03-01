@@ -49,9 +49,10 @@ class _HomePageState extends State<HomePage> {
   bool _isDownloading = false;
   bool _forceDownload = false;
   double _downloadProgress = 0;
+  int _downloadedDiveCount = 0;
   int? _totalDiveCount;
   final List<DcDive> _dives = [];
-  StreamSubscription<Map<String, dynamic>>? _downloadSubscription;
+  Timer? _progressTimer;
   int? _devInfoSerial;
   int? _devInfoFirmware;
 
@@ -64,7 +65,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _stopScan();
-    _downloadSubscription?.cancel();
+    _progressTimer?.cancel();
     super.dispose();
   }
 
@@ -154,8 +155,8 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _disconnect() async {
-    _downloadSubscription?.cancel();
-    _downloadSubscription = null;
+    _progressTimer?.cancel();
+    _progressTimer = null;
     setState(() => _statusMessage = 'Disconnecting...');
 
     try {
@@ -168,6 +169,7 @@ class _HomePageState extends State<HomePage> {
       _connectedDevice = null;
       _dives.clear();
       _downloadProgress = 0;
+      _downloadedDiveCount = 0;
       _totalDiveCount = null;
       _devInfoSerial = null;
       _devInfoFirmware = null;
@@ -175,15 +177,19 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  // MARK: - Download
+  // MARK: - Download (polling model)
+
+  bool _cancelRequested = false;
 
   void _cancelDownload() {
-    _downloadSubscription?.cancel();
-    _downloadSubscription = null;
+    _plugin.cancelDownload();
+    _cancelRequested = true;
     setState(() {
-      _isDownloading = false;
-      _statusMessage = 'Download cancelled — ${_dives.length} dives retrieved';
+      _statusMessage = 'Cancelling download...';
     });
+    // Don't stop the timer — let polling continue until libdivecomputer
+    // acknowledges the cancel. The normal completion path will fire,
+    // retrieve whatever dives were downloaded, and disconnect.
   }
 
   Future<void> _resetFingerprint() async {
@@ -194,9 +200,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _startDownload() {
+    _cancelRequested = false;
     setState(() {
       _isDownloading = true;
       _downloadProgress = 0;
+      _downloadedDiveCount = 0;
       _totalDiveCount = null;
       _dives.clear();
       _devInfoSerial = null;
@@ -204,65 +212,94 @@ class _HomePageState extends State<HomePage> {
       _statusMessage = 'Downloading dives...';
     });
 
-    _downloadSubscription = _plugin
-        .downloadDives(forceDownload: _forceDownload)
-        .listen(
-          (event) {
-            final type = event['type'] as String?;
+    // Fire and forget — start the native download
+    _plugin.startDownload(forceDownload: _forceDownload);
 
-            switch (type) {
-              case 'progress':
-                final current = event['current'] as int? ?? 0;
-                final maximum = event['maximum'] as int? ?? 1;
-                setState(() {
-                  _downloadProgress = maximum > 0 ? current / maximum : 0;
-                });
+    // Poll progress every 250ms (matching Subsurface's UI-polls-state model)
+    _progressTimer?.cancel();
+    _progressTimer = Timer.periodic(
+      const Duration(milliseconds: 250),
+      (_) => _pollProgress(),
+    );
+  }
 
-              case 'devinfo':
-                setState(() {
-                  _devInfoSerial = event['serial'] as int?;
-                  _devInfoFirmware = event['firmware'] as int?;
-                });
+  Future<void> _pollProgress() async {
+    try {
+      final progress = await _plugin.getDownloadProgress();
 
-              case 'totalDives':
-                setState(() {
-                  _totalDiveCount = event['totalDives'] as int?;
-                  if (_totalDiveCount != null) {
-                    _statusMessage =
-                        'Found $_totalDiveCount dives, downloading...';
-                  }
-                });
+      final isActive = progress['isActive'] as bool? ?? false;
+      final fraction = (progress['progressFraction'] as num?)?.toDouble() ?? 0;
+      final diveCount = progress['diveCount'] as int? ?? 0;
+      final totalDives = progress['estimatedTotalDives'] as int?;
+      final serial = progress['serial'] as int?;
+      final firmware = progress['firmware'] as int?;
+      final status = progress['status'] as String?;
 
-              case 'dive':
-                final dive = DcDive.fromMap(event);
-                final total = event['totalDives'] as int?;
-                setState(() {
-                  _dives.add(dive);
-                  if (total != null) _totalDiveCount = total;
-                  _statusMessage = _totalDiveCount != null
-                      ? 'Downloaded ${_dives.length} of $_totalDiveCount dives...'
-                      : 'Downloaded ${_dives.length} dives...';
-                });
+      if (!mounted) return;
 
-              case 'complete':
-                final total = event['totalDives'] as int? ?? _dives.length;
-                setState(() {
-                  _isDownloading = false;
-                  _downloadProgress = 1.0;
-                  _statusMessage = 'Download complete: $total dives';
-                });
-            }
-          },
-          onError: (error) {
-            setState(() {
-              _isDownloading = false;
-              _statusMessage = 'Download error: $error';
-            });
-          },
-          onDone: () {
-            setState(() => _isDownloading = false);
-          },
-        );
+      setState(() {
+        // Only move forward — libdivecomputer resets progress between
+        // phases (manifest → dive data), causing brief dips.
+        if (fraction > _downloadProgress) {
+          _downloadProgress = fraction;
+        }
+        _downloadedDiveCount = diveCount;
+        if (totalDives != null) _totalDiveCount = totalDives;
+        if (serial != null) _devInfoSerial = serial;
+        if (firmware != null) _devInfoFirmware = firmware;
+
+        if (isActive) {
+          final pct = (fraction * 100).toInt();
+          _statusMessage = diveCount > 0
+              ? 'Downloading... $pct% — $diveCount dives'
+              : 'Downloading... $pct%';
+        }
+      });
+
+      // Download finished — stop polling, retrieve dive data
+      if (!isActive && status != null) {
+        _progressTimer?.cancel();
+        _progressTimer = null;
+        await _retrieveDownloadedDives(status);
+      }
+    } catch (e) {
+      // Don't stop polling on transient errors
+      debugPrint('Progress poll error: $e');
+    }
+  }
+
+  Future<void> _retrieveDownloadedDives(String status) async {
+    final wasCancelled = _cancelRequested;
+    _cancelRequested = false;
+
+    setState(() {
+      _statusMessage = wasCancelled
+          ? 'Cancelled — loading downloaded dives...'
+          : 'Download $status — loading dive data...';
+    });
+
+    try {
+      final diveMaps = await _plugin.getDownloadedDives();
+      final dives = diveMaps.map((m) => DcDive.fromMap(m)).toList();
+
+      if (!mounted) return;
+
+      setState(() {
+        _dives.clear();
+        _dives.addAll(dives);
+        _isDownloading = false;
+        _downloadProgress = 1.0;
+        _statusMessage = wasCancelled
+            ? 'Cancelled: ${dives.length} dives retrieved'
+            : 'Download complete: ${dives.length} dives';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isDownloading = false;
+        _statusMessage = 'Error loading dives: $e';
+      });
+    }
   }
 
   // MARK: - Build
@@ -302,36 +339,23 @@ class _HomePageState extends State<HomePage> {
 
         // Scrollable device list
         Expanded(
-          child: ListView(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            children: [
-              if (_discoveredDevices.isEmpty && _isScanning)
-                const Card(
-                  child: ListTile(
-                    leading: Icon(
-                      Icons.bluetooth_searching,
-                      color: Colors.blue,
-                    ),
-                    title: Text('Scanning for dive computers...'),
-                    subtitle: Text(
-                      'Make sure your dive computer is in '
-                      'Bluetooth pairing mode',
-                    ),
+          child: _discoveredDevices.isEmpty
+              ? Center(
+                  child: Text(
+                    _isScanning
+                        ? 'Scanning for dive computers...'
+                        : 'Tap Scan to search for dive computers',
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodyLarge?.copyWith(color: Colors.grey),
                   ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  itemCount: _discoveredDevices.length,
+                  itemBuilder: (context, index) =>
+                      _buildDeviceCard(_discoveredDevices[index]),
                 ),
-              if (_discoveredDevices.isEmpty && !_isScanning && !_isConnecting)
-                const Card(
-                  child: ListTile(
-                    leading: Icon(Icons.bluetooth_disabled, color: Colors.grey),
-                    title: Text('No devices found'),
-                    subtitle: Text(
-                      'Press Scan to search for BLE dive computers',
-                    ),
-                  ),
-                ),
-              ..._discoveredDevices.map(_buildDeviceCard),
-            ],
-          ),
         ),
       ],
     );
@@ -339,17 +363,14 @@ class _HomePageState extends State<HomePage> {
 
   Widget _buildScanHeader() {
     return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
       children: [
-        Text('BLE Scan', style: Theme.of(context).textTheme.titleMedium),
-        const Spacer(),
+        Text('Devices', style: Theme.of(context).textTheme.titleMedium),
         if (_isScanning)
-          const Padding(
-            padding: EdgeInsets.only(right: 8.0),
-            child: SizedBox(
-              width: 16,
-              height: 16,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
+          const SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
           ),
         FilledButton.icon(
           onPressed: _isConnecting
@@ -531,7 +552,7 @@ class _HomePageState extends State<HomePage> {
           icon: Icon(_isDownloading ? Icons.hourglass_top : Icons.download),
           label: Text(
             _isDownloading
-                ? 'Downloading...'
+                ? (_cancelRequested ? 'Cancelling...' : 'Downloading...')
                 : _dives.isEmpty
                 ? 'Download Dives'
                 : 'Re-download',
@@ -539,9 +560,9 @@ class _HomePageState extends State<HomePage> {
         ),
         if (_isDownloading)
           OutlinedButton.icon(
-            onPressed: _cancelDownload,
+            onPressed: _cancelRequested ? null : _cancelDownload,
             icon: const Icon(Icons.cancel),
-            label: const Text('Cancel'),
+            label: Text(_cancelRequested ? 'Cancelling...' : 'Cancel'),
           ),
       ],
     );
@@ -558,9 +579,7 @@ class _HomePageState extends State<HomePage> {
         Text(
           _isDownloading
               ? '${(_downloadProgress * 100).toInt()}%  •  '
-                    '${_dives.length}'
-                    '${_totalDiveCount != null ? ' of ~$_totalDiveCount' : ''} '
-                    'dives'
+                    '$_downloadedDiveCount dives'
               : '${_dives.length} dives downloaded',
           style: Theme.of(context).textTheme.bodySmall,
         ),
@@ -653,7 +672,7 @@ class _HomePageState extends State<HomePage> {
       if (dive.gasStr.isNotEmpty) dive.gasStr,
     ];
 
-    final sampleCount = dive.samples?.length ?? 0;
+    final sampleCount = dive.sampleCount ?? dive.samples?.length ?? 0;
 
     return Card(
       child: ExpansionTile(
