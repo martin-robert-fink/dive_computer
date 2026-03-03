@@ -24,7 +24,7 @@ class DiveComputerPlugin : FlutterPlugin, MethodCallHandler {
         private const val TAG = "DiveComputerPlugin"
 
         init {
-            System.loadLibrary("divecomputer")
+            // libdivecomputer is statically linked into dive_computer_jni
             System.loadLibrary("dive_computer_jni")
         }
     }

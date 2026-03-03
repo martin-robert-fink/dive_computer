@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:dive_computer/dive_computer.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   runApp(const DiveComputerExampleApp());
@@ -77,9 +79,42 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  // MARK: - Android BLE Permissions
+
+  /// Requests BLE permissions required on Android 12+.
+  /// Returns true if all permissions are granted, false otherwise.
+  /// On non-Android platforms, always returns true.
+  Future<bool> _requestBlePermissions() async {
+    if (!Platform.isAndroid) return true;
+
+    final statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.locationWhenInUse,
+    ].request();
+
+    final allGranted = statuses.values.every((s) => s.isGranted);
+
+    if (!allGranted && mounted) {
+      final denied = statuses.entries
+          .where((e) => !e.value.isGranted)
+          .map((e) => e.key.toString().split('.').last)
+          .join(', ');
+      setState(() {
+        _statusMessage = 'Permissions denied: $denied';
+      });
+    }
+
+    return allGranted;
+  }
+
   // MARK: - Scanning
 
-  void _startScan() {
+  Future<void> _startScan() async {
+    // Request permissions on Android before scanning
+    final granted = await _requestBlePermissions();
+    if (!granted) return;
+
     setState(() {
       _isScanning = true;
       _discoveredDevices.clear();
