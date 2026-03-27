@@ -1,4 +1,4 @@
-package com.example.libdivecomputer_plugin
+package com.martinrobertfink.libdivecomputer_plugin
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -57,13 +57,13 @@ class DiveComputerPlugin : FlutterPlugin, MethodCallHandler {
 
         methodChannel = MethodChannel(
             binding.binaryMessenger,
-            "com.example.libdivecomputer_plugin/methods"
+            "com.martinrobertfink.libdivecomputer_plugin/methods"
         )
         methodChannel.setMethodCallHandler(this)
 
         scanEventChannel = EventChannel(
             binding.binaryMessenger,
-            "com.example.libdivecomputer_plugin/scan"
+            "com.martinrobertfink.libdivecomputer_plugin/scan"
         )
         scanEventChannel.setStreamHandler(ScanStreamHandler())
 

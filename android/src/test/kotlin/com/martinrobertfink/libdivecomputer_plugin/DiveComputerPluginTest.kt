@@ -1,4 +1,4 @@
-package com.example.dive_computer
+package com.martinrobertfink.libdivecomputer_plugin
 
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel

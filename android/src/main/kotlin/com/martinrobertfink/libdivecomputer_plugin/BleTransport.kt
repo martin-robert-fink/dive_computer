@@ -1,4 +1,4 @@
-package com.example.libdivecomputer_plugin
+package com.martinrobertfink.libdivecomputer_plugin
 
 import android.annotation.SuppressLint
 import android.bluetooth.*

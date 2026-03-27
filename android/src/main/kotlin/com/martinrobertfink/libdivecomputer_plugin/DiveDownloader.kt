@@ -1,4 +1,4 @@
-package com.example.libdivecomputer_plugin
+package com.martinrobertfink.libdivecomputer_plugin
 
 import android.content.Context
 import android.util.Log

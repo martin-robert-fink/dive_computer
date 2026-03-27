@@ -51,11 +51,11 @@ class DiveComputerPlugin {
   static final DiveComputerPlugin instance = DiveComputerPlugin._();
 
   static const MethodChannel _channel = MethodChannel(
-    'com.example.libdivecomputer_plugin/methods',
+    'com.martinrobertfink.libdivecomputer_plugin/methods',
   );
 
   static const EventChannel _scanChannel = EventChannel(
-    'com.example.libdivecomputer_plugin/scan',
+    'com.martinrobertfink.libdivecomputer_plugin/scan',
   );
 
   // ---------------------------------------------------------------------------
